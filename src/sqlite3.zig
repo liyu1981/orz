@@ -16,6 +16,7 @@ const is64 = @sizeOf(usize) == 8;
 pub const SqliteDb = struct {
     allocator: std.mem.Allocator,
 
+    database_name: []const u8,
     file_name: [:0]const u8,
     flags: usize,
     vfs: ?[]const u8,
@@ -33,9 +34,11 @@ pub const SqliteDb = struct {
         flags: usize = sqlite3.SQLITE_OPEN_READWRITE | sqlite3.SQLITE_OPEN_CREATE,
         vfs: ?[:0]const u8 = null,
     }) !SqliteDb {
+        const duped_file_name = try allocator.dupeZ(u8, file_name);
         return SqliteDb{
             .allocator = allocator,
-            .file_name = try allocator.dupeZ(u8, file_name),
+            .database_name = duped_file_name,
+            .file_name = duped_file_name,
             .flags = opts.flags,
             .vfs = opts.vfs,
             .sqlite_conn = @ptrFromInt(0),
@@ -46,16 +49,19 @@ pub const SqliteDb = struct {
     }
 
     pub fn deinit(this: *SqliteDb) void {
+        // database_name points to same mem of file_name, no free
         this.allocator.free(this.file_name);
         this.last_errmsg.deinit();
     }
 
     pub fn getDb(this: *SqliteDb) Db {
         return Db{
-            .ptr = this,
+            .ctx = this,
             .vtable = .{
                 .open = open,
                 .close = close,
+                .createDatabase = createDatabase,
+                .useDatabase = useDatabase,
                 .rawQueryEvaluate = rawQueryEvaluate,
                 .rawQueryNextRow = rawQueryNextRow,
                 .rawQueryNextCol = rawQueryNextCol,
@@ -114,6 +120,20 @@ pub const SqliteDb = struct {
     fn close(ctx: *anyopaque) void {
         const s: *SqliteDb = @ptrCast(@alignCast(ctx));
         _ = sqlite3.sqlite3_close(s.sqlite_conn);
+    }
+
+    fn createDatabase(ctx: *anyopaque, name: []const u8, opts: DbVTable.CreateDatabaseOpts) Error!void {
+        _ = opts;
+        // in sqlite this does not make sense, so simply redirect to useDatabase
+        try useDatabase(ctx, name);
+    }
+
+    fn useDatabase(ctx: *anyopaque, name: []const u8) Error!void {
+        const s: *SqliteDb = @ptrCast(@alignCast(ctx));
+        // in sqlite this does not make sense, so only check name match or not
+        if (!std.mem.eql(u8, s.database_name, name)) {
+            return error.DbUseDatabaseFailed;
+        }
     }
 
     fn rawQueryEvaluate(ctx: *anyopaque, query: *Query) Error!void {
@@ -398,7 +418,7 @@ test "sqlite3" {
     const output_writer = output_buf.writer();
     {
         const expected_output =
-            \\row 0: 1=db.ValueType{ .INT64 = 1 }, "hello"=db.ValueType{ .TEXT = { 104, 101, 108, 108, 111 } }, 5.0=db.ValueType{ .FLOAT64 = 5.0e+00 }, 
+            \\row 0: 1=db.ValueType{ .INT64 = 1 },"hello"=db.ValueType{ .TEXT = { 104, 101, 108, 108, 111 } },5.0=db.ValueType{ .FLOAT64 = 5.0e+00 },
             \\
         ;
         output_buf.clearRetainingCapacity();
@@ -412,7 +432,7 @@ test "sqlite3" {
                 var cit = row.iterator();
                 while (try cit.next()) |col| {
                     defer col.deinit();
-                    try output_writer.print("{s}={any}, ", .{ col.name, col.value });
+                    try output_writer.print("{s}={any},", .{ col.name, col.value });
                 }
                 try output_writer.print("\n", .{});
             } else {
@@ -423,7 +443,7 @@ test "sqlite3" {
     }
     {
         const expected_output =
-            \\row 0: ?=db.ValueType{ .INT64 = 1 }, $name=db.ValueType{ .FLOAT64 = 5.0e+00 }, ?2=db.ValueType{ .FLOAT64 = 5.0e+00 }, 
+            \\row 0: ?=db.ValueType{ .INT64 = 1 },$name=db.ValueType{ .FLOAT64 = 5.0e+00 },?2=db.ValueType{ .FLOAT64 = 5.0e+00 },
             \\
         ;
         output_buf.clearRetainingCapacity();
@@ -446,7 +466,7 @@ test "sqlite3" {
                 var cit = row.iterator();
                 while (try cit.next()) |col| {
                     defer col.deinit();
-                    try output_writer.print("{s}={any}, ", .{ col.name, col.value });
+                    try output_writer.print("{s}={any},", .{ col.name, col.value });
                 }
                 try output_writer.print("\n", .{});
             } else {

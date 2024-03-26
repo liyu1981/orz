@@ -2,6 +2,7 @@ const std = @import("std");
 
 pub const Error = error{
     DbConnFailed,
+    DbUseDatabaseFailed,
     StmtPrepareFailed,
     StmtFetchRowFailed,
     StmtFetchRowBusy,
@@ -30,6 +31,8 @@ pub const DataType = enum {
     TEXT,
     BLOB,
 };
+
+// schema & create
 
 // query
 
@@ -270,34 +273,49 @@ pub const QueryCol = struct {
 // db
 
 pub const DbVTable = struct {
+    pub const CreateDatabaseOpts = struct {
+        auto_use: bool = true,
+        error_if_exist: bool = true,
+    };
+
     open: *const fn (ctx: *anyopaque) Error!void,
     close: *const fn (ctx: *anyopaque) void,
+    createDatabase: *const fn (ctx: *anyopaque, name: []const u8, opts: CreateDatabaseOpts) Error!void,
+    useDatabase: *const fn (ctx: *anyopaque, name: []const u8) Error!void,
     rawQueryEvaluate: *const fn (ctx: *anyopaque, query: *Query) Error!void,
     rawQueryNextRow: *const fn (ctx: *anyopaque) Error!?usize,
     rawQueryNextCol: *const fn (ctx: *anyopaque, row: *QueryRow, col_idx: usize) Error!?QueryCol,
 };
 
 pub const Db = struct {
-    ptr: *anyopaque,
+    ctx: *anyopaque,
     vtable: DbVTable,
 
     pub inline fn open(this: *Db) Error!void {
-        try this.vtable.open(this.ptr);
+        try this.vtable.open(this.ctx);
     }
 
     pub inline fn close(this: *Db) void {
-        this.vtable.close(this.ptr);
+        this.vtable.close(this.ctx);
+    }
+
+    pub inline fn createDatabase(this: *Db, name: []const u8, opts: DbVTable.CreateDatabaseOpts) Error!void {
+        try this.vtable.createDatabase(this.ctx, name, opts);
+    }
+
+    pub inline fn useDatabase(this: *Db, name: []const u8) Error!void {
+        try this.vtable.useDatabase(this.ctx, name);
     }
 
     pub inline fn rawQueryEvaluate(this: *Db, query: *Query) Error!void {
-        try this.vtable.rawQueryEvaluate(this.ptr, query);
+        try this.vtable.rawQueryEvaluate(this.ctx, query);
     }
 
     pub inline fn rawQueryNextRow(this: *Db) Error!?usize {
-        return this.vtable.rawQueryNextRow(this.ptr);
+        return this.vtable.rawQueryNextRow(this.ctx);
     }
 
     pub inline fn rawQueryNextCol(this: *Db, row: *QueryRow, col_idx: usize) Error!?QueryCol {
-        return this.vtable.rawQueryNextCol(this.ptr, row, col_idx);
+        return this.vtable.rawQueryNextCol(this.ctx, row, col_idx);
     }
 };

@@ -139,6 +139,41 @@ pub const Query = struct {
             _ = this.db.finalizeQuery();
         }
     }
+
+    pub fn into(this: *Query, comptime DestType: type, dest_slice: []DestType) !void {
+        var rit = try this.iterator();
+        var i: usize = 0;
+        while (true) {
+            var maybe_row = try rit.next();
+            if (maybe_row) |*row| {
+                if (i >= dest_slice.len) {
+                    return error.QueryIntoOutOfBounds;
+                }
+                try QueryRow.into(row, DestType, &dest_slice[i]);
+                i += 1;
+            } else break;
+        }
+    }
+
+    pub fn intoAlloc(this: *Query, comptime DestType: type, opts: struct {
+        alloc_batch_size: usize = 8,
+    }) ![]DestType {
+        var arr = try this.allocator.alloc(DestType, opts.alloc_batch_size);
+        defer this.allocator.free(arr);
+        var rit = try this.iterator();
+        var i: usize = 0;
+        while (true) {
+            var maybe_row = try rit.next();
+            if (maybe_row) |*row| {
+                if (i >= arr.len) {
+                    arr = try this.allocator.realloc(arr, arr.len * 2);
+                }
+                try QueryRow.into(row, DestType, &arr[i]);
+                i += 1;
+            } else break;
+        }
+        return try this.allocator.dupe(DestType, arr[0..i]);
+    }
 };
 
 pub const QueryRow = struct {

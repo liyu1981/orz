@@ -478,4 +478,36 @@ test "sqlite3" {
             return error.RowNotExist;
         }
     }
+    {
+        const Record = struct {
+            count: i64,
+        };
+        var records: [5]Record = undefined;
+        var q = try Query.init(testing.allocator, &db, "with recursive cnt(x) as (select 1 union all select x+1 from cnt limit 5) select x from cnt", null);
+        defer q.deinit();
+        try q.into(Record, &records);
+        try testing.expectEqualDeep([5]Record{
+            Record{ .count = 1 },
+            Record{ .count = 2 },
+            Record{ .count = 3 },
+            Record{ .count = 4 },
+            Record{ .count = 5 },
+        }, records);
+    }
+    {
+        const Record = struct {
+            count: i64,
+        };
+        var q = try Query.init(testing.allocator, &db, "with recursive cnt(x) as (select 1 union all select x+1 from cnt limit 5) select x from cnt", null);
+        defer q.deinit();
+        const records = try q.intoAlloc(Record, .{});
+        defer q.allocator.free(records);
+        try testing.expectEqualDeep(&[5]Record{
+            Record{ .count = 1 },
+            Record{ .count = 2 },
+            Record{ .count = 3 },
+            Record{ .count = 4 },
+            Record{ .count = 5 },
+        }, records);
+    }
 }

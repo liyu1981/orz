@@ -6,6 +6,11 @@ pub const Error = error{
     StmtFetchRowFailed,
     StmtFetchRowBusy,
     StmtFetchRowMisuse,
+    StmtBindMisuse,
+    StmtBindNameNotFound,
+    StmtBindTooBig,
+    StmtBindNomem,
+    StmtBindRange,
 } || std.mem.Allocator.Error;
 
 // data type
@@ -41,7 +46,7 @@ pub const ValueType = union(DataType) {
     FLOAT32: f32,
     FLOAT64: f64,
     TEXT: []const u8,
-    BLOB: []const u8,
+    BLOB: []const i8,
 
     pub fn free(this: ValueType, allocator: std.mem.Allocator) void {
         switch (this) {
@@ -50,9 +55,26 @@ pub const ValueType = union(DataType) {
             else => {},
         }
     }
+
+    pub fn getValue(vt: *const ValueType, comptime WantedType: type, allocator: std.mem.Allocator) !WantedType {
+        const ti = @typeInfo(ValueType);
+        inline for (ti.Union.fields) |field| {
+            if (field.type == WantedType) {
+                switch (field.type) {
+                    []const u8 => return try allocator.dupe(u8, @field(vt, field.name)),
+                    []const i8 => return try allocator.dupe(i8, @field(vt, field.name)),
+                    else => return @field(vt, field.name),
+                }
+            }
+        }
+        @panic(@typeName(WantedType) ++ " can not be found in ValueType.");
+    }
 };
 
-pub const QueryArg = ValueType;
+pub const QueryArg = struct {
+    namez: ?[:0]const u8 = null,
+    value: ValueType,
+};
 
 pub const Query = struct {
     pub const Iterator = struct {
@@ -77,7 +99,7 @@ pub const Query = struct {
     db: *Db,
     raw_query: [:0]const u8,
     raw_bind_args: ?[]const QueryArg,
-    evaluated: bool = false,
+    prepared: bool = false,
     finalized: bool = false,
     col_count: usize = 0,
     row_affected: usize = 0,
@@ -106,14 +128,14 @@ pub const Query = struct {
 
     /// return row iterator
     pub fn iterator(this: *Query) !Iterator {
-        if (!this.evaluated) {
+        if (!this.prepared) {
             try this.db.rawQueryEvaluate(this);
         }
         return Iterator{ .q = this };
     }
 
     pub fn finalize(this: *Query) void {
-        if (this.evaluated) {
+        if (this.preapred) {
             _ = this.db.finalizeQuery();
         }
     }
@@ -150,6 +172,51 @@ pub const QueryRow = struct {
     /// return col iterator
     pub fn iterator(this: *QueryRow) Iterator {
         return Iterator{ .row = this, .fetched_col_count = 0 };
+    }
+
+    pub fn getColAtIdx(this: *QueryRow, idx: usize) !?QueryCol {
+        const maybe_colpair = try this.q.db.rawQueryNextCol(this, idx);
+        if (maybe_colpair) |colpair| {
+            return QueryCol{
+                .allocator = colpair.allocator,
+                .row = this,
+                .name = colpair.name,
+                .value = colpair.value,
+            };
+        } else {
+            return null;
+        }
+    }
+
+    pub fn into(row: *QueryRow, DestType: type, dest: *DestType) !void {
+        const dest_typeinfo = @typeInfo(DestType);
+        switch (dest_typeinfo) {
+            .Struct => {},
+            else => {
+                @compileError("dest_struct should be mutable pointer to struct, find pointer to:" ++ @typeName(DestType));
+            },
+        }
+        if (row.q.col_count != dest_typeinfo.Struct.fields.len) {
+            return error.RowIntoNoEqlStruct;
+        }
+        const dest_fields = dest_typeinfo.Struct.fields;
+        inline for (dest_fields, 0..) |field, i| {
+            const maybe_qc = try row.getColAtIdx(i);
+            if (maybe_qc) |qc| {
+                defer qc.deinit();
+                @field(dest, field.name) = try ValueType.getValue(&qc.value, field.type, row.q.allocator);
+            } else {
+                switch (@typeInfo(field.type)) {
+                    .Optional => {
+                        @field(dest, field.name) = null;
+                    },
+                    else => {
+                        std.debug.print("row col {d} is null while {s}: {s} accepts no null.\n", .{ i, field.name, @typeName(field.type) });
+                        return error.RowColIsNull;
+                    },
+                }
+            }
+        }
     }
 };
 

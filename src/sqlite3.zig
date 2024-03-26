@@ -71,6 +71,32 @@ pub const SqliteDb = struct {
         std.debug.print("err: {s}\n", .{this.last_errmsg.items});
     }
 
+    // utils
+
+    fn checkBindResultOk(ret: usize) !void {
+        switch (ret) {
+            sqlite3.SQLITE_OK => {},
+            sqlite3.SQLITE_MISUSE => {
+                return error.StmtBindMisuse;
+            },
+            sqlite3.SQLITE_TOOBIG => {
+                return error.StmtBindTooBig;
+            },
+            sqlite3.SQLITE_NOMEM => {
+                return error.StmtBindNomem;
+            },
+            sqlite3.SQLITE_RANGE => {
+                return error.StmtBindRange;
+            },
+            else => {
+                std.debug.print("ret = {d}\n", .{ret});
+                @panic("TODO: handle this!");
+            },
+        }
+    }
+
+    // vtable methods
+
     fn open(ctx: *anyopaque) Error!void {
         var s: *SqliteDb = @ptrCast(@alignCast(ctx));
         s.last_errcode = sqlite3.sqlite3_open_v2(
@@ -93,7 +119,7 @@ pub const SqliteDb = struct {
     fn rawQueryEvaluate(ctx: *anyopaque, query: *Query) Error!void {
         const s: *SqliteDb = @ptrCast(@alignCast(ctx));
 
-        const ret = sqlite3.sqlite3_prepare_v3(
+        var ret = sqlite3.sqlite3_prepare_v3(
             s.sqlite_conn,
             query.raw_query.ptr,
             query.raw_query.len,
@@ -109,8 +135,54 @@ pub const SqliteDb = struct {
             _ = sqlite3.sqlite3_finalize(s.stmt);
             query.finalized = true;
         }
+
+        if (query.raw_bind_args) |bind_args| {
+            var next_index: usize = 1;
+            for (bind_args) |bind_arg| {
+                const idx = brk: {
+                    if (bind_arg.namez) |namez| {
+                        const name_idx = sqlite3.sqlite3_bind_parameter_index(s.stmt, namez.ptr);
+                        if (name_idx == 0) {
+                            std.debug.print("{s} is not found in stmt: {s}\n", .{ namez, query.raw_query });
+                            return error.StmtBindNameNotFound;
+                        }
+                        break :brk name_idx;
+                    } else {
+                        const next_idx = next_index;
+                        next_index += 1;
+                        break :brk next_idx;
+                    }
+                };
+
+                switch (bind_arg.value) {
+                    .NULL => {
+                        ret = sqlite3.sqlite3_bind_null(s.stmt, idx);
+                        try SqliteDb.checkBindResultOk(ret);
+                    },
+                    .INT64 => |i64v| {
+                        ret = sqlite3.sqlite3_bind_int64(s.stmt, idx, i64v);
+                        try SqliteDb.checkBindResultOk(ret);
+                    },
+                    .FLOAT64 => |f64v| {
+                        ret = sqlite3.sqlite3_bind_double(s.stmt, idx, f64v);
+                        try SqliteDb.checkBindResultOk(ret);
+                    },
+                    .TEXT => |textv| {
+                        ret = sqlite3.sqlite3_bind_text(s.stmt, idx, textv.ptr, textv.len, sqlite3.SQLITE_STATIC);
+                        try SqliteDb.checkBindResultOk(ret);
+                    },
+                    .BLOB => |blobv| {
+                        ret = sqlite3.sqlite3_bind_blob(s.stmt, idx, blobv.ptr, blobv.len, sqlite3.SQLITE_STATIC);
+                        try SqliteDb.checkBindResultOk(ret);
+                    },
+                    else => unreachable,
+                }
+            }
+        }
+
+        s.row_fetched = 0;
         query.col_count = sqlite3.sqlite3_column_count(s.stmt);
-        query.evaluated = true;
+        query.prepared = true;
     }
 
     fn rawQueryNextRow(ctx: *anyopaque) Error!?usize {
@@ -199,7 +271,7 @@ pub const SqliteDb = struct {
                     .allocator = s.allocator,
                     .row = row,
                     .name = name,
-                    .value = ValueType{ .BLOB = try s.allocator.dupe(u8, cblob[0..len]) },
+                    .value = ValueType{ .BLOB = try s.allocator.dupe(i8, cblob[0..len]) },
                 };
             },
             sqlite3.SQLITE_NULL => {
@@ -285,6 +357,9 @@ pub const SqliteDb = struct {
         pub const SQLITE_NULL = 5;
         pub const SQLITE3_TEXT = 3;
 
+        // bind api
+        pub const SQLITE_STATIC = @as(*allowzero anyopaque, @ptrFromInt(0));
+
         extern fn sqlite3_errmsg(pDb: *allowzero anyopaque) [*c]const u8;
         extern fn sqlite3_open_v2(filename: [*c]const u8, ppDb: **allowzero anyopaque, flags: usize, zVfs: [*c]const u8) usize;
         extern fn sqlite3_close(pDb: *allowzero anyopaque) usize;
@@ -294,12 +369,20 @@ pub const SqliteDb = struct {
         extern fn sqlite3_column_count(pStmt: *allowzero anyopaque) usize;
         extern fn sqlite3_column_name(pStmt: *allowzero anyopaque, N: usize) [*c]u8;
         extern fn sqlite3_column_type(pStmt: *allowzero anyopaque, iCol: usize) usize;
-        extern fn sqlite3_column_blob(pStmt: *allowzero anyopaque, iCol: usize) [*c]u8;
+        extern fn sqlite3_column_blob(pStmt: *allowzero anyopaque, iCol: usize) [*c]i8;
         extern fn sqlite3_column_double(pStmt: *allowzero anyopaque, iCol: usize) f64;
         extern fn sqlite3_column_int(pStmt: *allowzero anyopaque, iCol: usize) c_int;
         extern fn sqlite3_column_int64(pStmt: *allowzero anyopaque, iCol: usize) i64;
         extern fn sqlite3_column_text(pStmt: *allowzero anyopaque, iCol: usize) [*c]u8;
         extern fn sqlite3_column_bytes(pStmt: *allowzero anyopaque, iCol: usize) usize;
+        extern fn sqlite3_bind_blob(pStmt: *allowzero anyopaque, index: usize, blob: [*c]const i8, len: usize, lifetime_opt: *allowzero anyopaque) usize;
+        extern fn sqlite3_bind_blob64(pStmt: *allowzero anyopaque, index: usize, blob: [*c]const i8, len: usize, lifetime_opt: *allowzero anyopaque) usize;
+        extern fn sqlite3_bind_double(pStmt: *allowzero anyopaque, index: usize, v: f64) usize;
+        extern fn sqlite3_bind_int(pStmt: *allowzero anyopaque, index: usize, v: i32) usize;
+        extern fn sqlite3_bind_int64(pStmt: *allowzero anyopaque, index: usize, v: i64) usize;
+        extern fn sqlite3_bind_null(pStmt: *allowzero anyopaque, index: usize) usize;
+        extern fn sqlite3_bind_text(pStmt: *allowzero anyopaque, index: usize, text: [*c]const u8, len: usize, lifetime_opt: *allowzero anyopaque) usize;
+        extern fn sqlite3_bind_parameter_index(pStmt: *allowzero anyopaque, zName: [*c]const u8) usize;
     };
 };
 
@@ -319,7 +402,7 @@ test "sqlite3" {
             \\
         ;
         output_buf.clearRetainingCapacity();
-        var q = try Query.init(std.testing.allocator, &db, "select 1, \"hello\", 5.0", null);
+        var q = try Query.init(testing.allocator, &db, "select 1, \"hello\", 5.0", null);
         defer q.deinit();
         var rit = try q.iterator();
         while (true) {
@@ -337,5 +420,62 @@ test "sqlite3" {
             }
         }
         try testing.expectEqualSlices(u8, expected_output, output_buf.items);
+    }
+    {
+        const expected_output =
+            \\row 0: ?=db.ValueType{ .INT64 = 1 }, $name=db.ValueType{ .FLOAT64 = 5.0e+00 }, ?2=db.ValueType{ .FLOAT64 = 5.0e+00 }, 
+            \\
+        ;
+        output_buf.clearRetainingCapacity();
+        var q = try Query.init(
+            testing.allocator,
+            &db,
+            "select ?, $name, ?2",
+            &[_]QueryArg{
+                QueryArg{ .value = .{ .INT64 = 1 } },
+                QueryArg{ .namez = "$name", .value = .{ .TEXT = "hello" } },
+                QueryArg{ .value = .{ .FLOAT64 = 5.0 } },
+            },
+        );
+        defer q.deinit();
+        var rit = try q.iterator();
+        while (true) {
+            var maybe_row = try rit.next();
+            if (maybe_row) |*row| {
+                try output_writer.print("row {d}: ", .{row.row_seqid});
+                var cit = row.iterator();
+                while (try cit.next()) |col| {
+                    defer col.deinit();
+                    try output_writer.print("{s}={any}, ", .{ col.name, col.value });
+                }
+                try output_writer.print("\n", .{});
+            } else {
+                break;
+            }
+        }
+        try testing.expectEqualSlices(u8, expected_output, output_buf.items);
+    }
+    {
+        const Record = struct {
+            col1: i64,
+            name: []const u8,
+            col3: f64,
+
+            pub fn free(this: *const @This(), allocator: std.mem.Allocator) void {
+                allocator.free(this.name);
+            }
+        };
+        var record: Record = undefined;
+        var q = try Query.init(testing.allocator, &db, "select 1, \"hello\", 5.0", null);
+        defer q.deinit();
+        var rit = try q.iterator();
+        var maybe_row = try rit.next();
+        if (maybe_row) |*row| {
+            try QueryRow.into(row, Record, &record);
+            defer record.free(testing.allocator);
+            try testing.expectEqualDeep(Record{ .col1 = 1, .name = "hello", .col3 = 5.0 }, record);
+        } else {
+            return error.RowNotExist;
+        }
     }
 }

@@ -18,6 +18,7 @@ pub const Error = error{
 
 pub const DataType = enum {
     NULL,
+    BOOL,
     INT8,
     UINT8,
     INT16,
@@ -34,10 +35,72 @@ pub const DataType = enum {
 
 // schema & create
 
+pub const Schema = struct {
+    fn checkEntDef(comptime EntType: type) void {
+        const ti = @typeInfo(EntType);
+        const vt = @typeInfo(ValueType).Union;
+        switch (ti) {
+            .Struct => |st| {
+                if (st.is_tuple) {
+                    @compileError("EntType must be struct, found tuple:" ++ @typeName(EntType));
+                }
+                inline for (st.fields) |field| {
+                    comptime var found: bool = false;
+                    inline for (vt.fields) |vtfield| {
+                        if (vtfield.type == field.type) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        @compileError("EntType field '" ++ field.name ++ "'' is not allowed in ValueType, found:" ++ @typeName(field.type));
+                    }
+                }
+            },
+            else => {
+                @compileError("EntType must be struct, found:" ++ @typeName(EntType));
+            },
+        }
+    }
+
+    pub fn defineTable(comptime EntType: type) type {
+        const MAX_COLS = 8192;
+        const fields = @typeInfo(EntType).Struct.fields;
+        comptime var count: usize = 0;
+        comptime var ent_col_names: [MAX_COLS][]const u8 = undefined;
+        comptime var ent_col_types: [MAX_COLS]ValueType = undefined;
+        inline for (fields) |field| {
+            ent_col_names[count] = field.name;
+            ent_col_types[count] = ValueType.getUndefined(field.type);
+            count += 1;
+        }
+        const tname = comptime brk: {
+            const full_type_name = @typeName(EntType);
+            var it = std.mem.splitBackwardsAny(u8, full_type_name, ".");
+            if (it.next()) |last_name| {
+                break :brk last_name;
+            } else {
+                @panic("Impossible, no last name fragment?:" ++ full_type_name);
+            }
+        };
+        return struct {
+            table_name: []const u8 = tname,
+            col_names: [][]const u8 = ent_col_names[0..count],
+            col_types: []ValueType = ent_col_types[0..count],
+        };
+    }
+
+    pub fn table(comptime EntType: type) defineTable(EntType) {
+        checkEntDef(EntType);
+        return defineTable(EntType){};
+    }
+};
+
 // query
 
 pub const ValueType = union(DataType) {
     NULL: void,
+    BOOL: bool,
     INT8: i8,
     UINT8: u8,
     INT16: i16,
@@ -50,6 +113,28 @@ pub const ValueType = union(DataType) {
     FLOAT64: f64,
     TEXT: []const u8,
     BLOB: []const i8,
+
+    pub fn getUndefined(comptime T: type) ValueType {
+        switch (T) {
+            void => return ValueType{ .NULL = undefined },
+            bool => return ValueType{ .BOOL = undefined },
+            i8 => return ValueType{ .INT8 = undefined },
+            u8 => return ValueType{ .UINT8 = undefined },
+            i16 => return ValueType{ .INT16 = undefined },
+            u16 => return ValueType{ .UINT16 = undefined },
+            i32 => return ValueType{ .INT32 = undefined },
+            u32 => return ValueType{ .UINT32 = undefined },
+            i64 => return ValueType{ .INT64 = undefined },
+            u64 => return ValueType{ .UINT64 = undefined },
+            f32 => return ValueType{ .FLOAT32 = undefined },
+            f64 => return ValueType{ .FLOAT64 = undefined },
+            []const u8 => return ValueType{ .TEXT = undefined },
+            []const i8 => return ValueType{ .BLOB = undefined },
+            else => {
+                @compileError("Unsupported type: " ++ @typeName(T));
+            },
+        }
+    }
 
     pub fn free(this: ValueType, allocator: std.mem.Allocator) void {
         switch (this) {
@@ -85,7 +170,7 @@ pub const Query = struct {
         fetched_row_count: usize = 0,
 
         pub fn next(this: *Iterator) !?QueryRow {
-            if (try this.q.db.rawQueryNextRow()) |row_seqid| {
+            if (try this.q.db.queryNextRow()) |row_seqid| {
                 this.fetched_row_count += 1;
                 this.q.row_affected += 1;
                 return QueryRow{
@@ -132,14 +217,14 @@ pub const Query = struct {
     /// return row iterator
     pub fn iterator(this: *Query) !Iterator {
         if (!this.prepared) {
-            try this.db.rawQueryEvaluate(this);
+            try this.db.queryEvaluate(this);
         }
         return Iterator{ .q = this };
     }
 
     pub fn finalize(this: *Query) void {
-        if (this.preapred) {
-            _ = this.db.finalizeQuery();
+        if (!this.finalized and this.prepared) {
+            _ = this.db.queryFinalize(this);
         }
     }
 
@@ -270,6 +355,61 @@ pub const QueryCol = struct {
     }
 };
 
+// change set
+
+pub const ChangeSet = struct {
+    allocator: std.mem.Allocator,
+    query_buf: []Query,
+    query_len: usize = 0,
+
+    pub fn init(allocator: std.mem.Allocator) !ChangeSet {
+        return ChangeSet{
+            .allocator = allocator,
+            .query_buf = try allocator.alloc(Query, 8),
+        };
+    }
+
+    pub fn deinit(this: *const ChangeSet) void {
+        for (0..this.query_len) |i| {
+            this.query_buf[i].deinit();
+        }
+        this.allocator.free(this.query_buf);
+    }
+
+    fn ensureCapcityFor(this: *ChangeSet, size: usize) !void {
+        if (size + this.query_len >= this.query_buf.len) {
+            this.query_buf = try this.allocator.realloc(this.query_buf, this.query_buf.len * 2);
+        }
+    }
+
+    pub fn append(this: *ChangeSet, q: Query) !void {
+        try this.ensureCapcityFor(1);
+        this.query_buf[this.query_len] = q;
+        this.query_len += 1;
+    }
+};
+
+// migration
+
+pub const Migration = struct {
+    pub const VTable = struct {
+        up: *const fn (ctx: *anyopaque) Error!?ChangeSet,
+        down: *const fn (ctx: *anyopaque) Error!?ChangeSet,
+    };
+
+    id: []const u8,
+    ctx: *anyopaque,
+    vtable: VTable,
+
+    pub inline fn up(this: *Migration) Error!?ChangeSet {
+        return this.vtable.up(this.ctx);
+    }
+
+    pub inline fn down(this: *Migration) Error!?ChangeSet {
+        return this.vtable.down(this.ctx);
+    }
+};
+
 // db
 
 pub const DbVTable = struct {
@@ -277,45 +417,87 @@ pub const DbVTable = struct {
         auto_use: bool = true,
         error_if_exist: bool = true,
     };
+    pub const CreateTableOpts = struct {};
 
-    open: *const fn (ctx: *anyopaque) Error!void,
-    close: *const fn (ctx: *anyopaque) void,
-    createDatabase: *const fn (ctx: *anyopaque, name: []const u8, opts: CreateDatabaseOpts) Error!void,
-    useDatabase: *const fn (ctx: *anyopaque, name: []const u8) Error!void,
-    rawQueryEvaluate: *const fn (ctx: *anyopaque, query: *Query) Error!void,
-    rawQueryNextRow: *const fn (ctx: *anyopaque) Error!?usize,
-    rawQueryNextCol: *const fn (ctx: *anyopaque, row: *QueryRow, col_idx: usize) Error!?QueryCol,
+    implOpen: *const fn (ctx: *anyopaque) Error!void,
+    implClose: *const fn (ctx: *anyopaque) void,
+
+    implCreateDatabase: *const fn (ctx: *anyopaque, name: []const u8, opts: CreateDatabaseOpts) Error!void,
+    implUseDatabase: *const fn (ctx: *anyopaque, name: []const u8) Error!void,
+
+    implQueryEvaluate: *const fn (ctx: *anyopaque, query: *Query) Error!void,
+    implQueryNextRow: *const fn (ctx: *anyopaque) Error!?usize,
+    implQueryNextCol: *const fn (ctx: *anyopaque, row: *QueryRow, col_idx: usize) Error!?QueryCol,
+    implQueryFinalize: *const fn (ctx: *anyopaque, query: *Query) usize,
+
+    implMigrate: *const fn (ctx: *anyopaque, db: *Db, migration: *Migration) Error!void,
+    implCreateTable: *const fn (ctx: *anyopaque, db: *Db, table_name: []const u8, col_names: [][]const u8, col_types: []ValueType, opts: CreateTableOpts) Error!Query,
 };
 
 pub const Db = struct {
     ctx: *anyopaque,
     vtable: DbVTable,
 
+    // vtable fn shortcuts
+
     pub inline fn open(this: *Db) Error!void {
-        try this.vtable.open(this.ctx);
+        try this.vtable.implOpen(this.ctx);
     }
 
     pub inline fn close(this: *Db) void {
-        this.vtable.close(this.ctx);
+        this.vtable.implClose(this.ctx);
     }
 
     pub inline fn createDatabase(this: *Db, name: []const u8, opts: DbVTable.CreateDatabaseOpts) Error!void {
-        try this.vtable.createDatabase(this.ctx, name, opts);
+        try this.vtable.implCreateDatabase(this.ctx, name, opts);
     }
 
     pub inline fn useDatabase(this: *Db, name: []const u8) Error!void {
-        try this.vtable.useDatabase(this.ctx, name);
+        try this.vtable.implUseDatabase(this.ctx, name);
     }
 
-    pub inline fn rawQueryEvaluate(this: *Db, query: *Query) Error!void {
-        try this.vtable.rawQueryEvaluate(this.ctx, query);
+    pub inline fn queryEvaluate(this: *Db, query: *Query) Error!void {
+        std.debug.print("evaluate query: {s}\n", .{query.raw_query});
+        try this.vtable.implQueryEvaluate(this.ctx, query);
     }
 
-    pub inline fn rawQueryNextRow(this: *Db) Error!?usize {
-        return this.vtable.rawQueryNextRow(this.ctx);
+    pub inline fn queryNextRow(this: *Db) Error!?usize {
+        return this.vtable.implQueryNextRow(this.ctx);
     }
 
-    pub inline fn rawQueryNextCol(this: *Db, row: *QueryRow, col_idx: usize) Error!?QueryCol {
-        return this.vtable.rawQueryNextCol(this.ctx, row, col_idx);
+    pub inline fn queryNextCol(this: *Db, row: *QueryRow, col_idx: usize) Error!?QueryCol {
+        return this.vtable.implQueryNextCol(this.ctx, row, col_idx);
+    }
+
+    pub inline fn queryFinalize(this: *Db, query: *Query) usize {
+        return this.vtable.implQueryFinalize(this.ctx, query);
+    }
+
+    pub inline fn migrate(this: *Db, migration: *Migration) Error!void {
+        return try this.vtable.implMigrate(this.ctx, this, migration);
+    }
+
+    // wrappers
+
+    pub fn queryExecute(this: *Db, query: *Query) Error!void {
+        try this.queryEvaluate(query);
+        var rit = try query.iterator();
+        _ = try rit.next();
+        query.finalize();
+    }
+
+    pub fn queryExecuteSlice(this: *Db, allocator: std.mem.Allocator, query: []const u8) Error!void {
+        var q = try Query.init(allocator, this, query, null);
+        try this.queryEvaluate(&q);
+        var rit = try q.iterator();
+        _ = try rit.next();
+        q.finalize();
+        q.deinit();
+    }
+
+    // migration fns
+
+    pub fn createTable(this: *Db, ent: anytype, opts: DbVTable.CreateTableOpts) Error!Query {
+        return try this.vtable.implCreateTable(this.ctx, this, ent.table_name, ent.col_names, ent.col_types, opts);
     }
 };

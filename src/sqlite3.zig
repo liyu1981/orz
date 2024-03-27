@@ -1,15 +1,20 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const testing = std.testing;
 
-const generaldb = @import("db.zig");
-const Error = generaldb.Error;
-const Db = generaldb.Db;
-const QueryArg = generaldb.QueryArg;
-const Query = generaldb.Query;
-const DbVTable = generaldb.DbVTable;
-const ValueType = generaldb.ValueType;
-const QueryCol = generaldb.QueryCol;
-const QueryRow = generaldb.QueryRow;
+const generalDb = @import("db.zig");
+const Error = generalDb.Error;
+const Db = generalDb.Db;
+const QueryArg = generalDb.QueryArg;
+const Query = generalDb.Query;
+const DbVTable = generalDb.DbVTable;
+const ValueType = generalDb.ValueType;
+const QueryCol = generalDb.QueryCol;
+const QueryRow = generalDb.QueryRow;
+const Migration = generalDb.Migration;
+const DataType = generalDb.DataType;
+const ChangeSet = generalDb.ChangeSet;
+const Schema = generalDb.Schema;
 
 const is64 = @sizeOf(usize) == 8;
 
@@ -58,13 +63,16 @@ pub const SqliteDb = struct {
         return Db{
             .ctx = this,
             .vtable = .{
-                .open = open,
-                .close = close,
-                .createDatabase = createDatabase,
-                .useDatabase = useDatabase,
-                .rawQueryEvaluate = rawQueryEvaluate,
-                .rawQueryNextRow = rawQueryNextRow,
-                .rawQueryNextCol = rawQueryNextCol,
+                .implOpen = open,
+                .implClose = close,
+                .implCreateDatabase = createDatabase,
+                .implUseDatabase = useDatabase,
+                .implQueryEvaluate = queryEvaluate,
+                .implQueryNextRow = queryNextRow,
+                .implQueryNextCol = queryNextCol,
+                .implQueryFinalize = queryFinalize,
+                .implMigrate = migrate,
+                .implCreateTable = createTable,
             },
         };
     }
@@ -101,6 +109,17 @@ pub const SqliteDb = struct {
         }
     }
 
+    fn valueTypeToSqlite3Type(vt: ValueType) []const u8 {
+        switch (vt) {
+            .NULL => return "NULL",
+            .BOOL => return "INTEGER",
+            .INT8, .UINT8, .INT16, .UINT16, .INT32, .UINT32, .INT64, .UINT64 => return "INTEGER",
+            .FLOAT32, .FLOAT64 => return "REAL",
+            .TEXT => return "TEXT",
+            .BLOB => return "BLOB",
+        }
+    }
+
     // vtable methods
 
     fn open(ctx: *anyopaque) Error!void {
@@ -119,7 +138,7 @@ pub const SqliteDb = struct {
 
     fn close(ctx: *anyopaque) void {
         const s: *SqliteDb = @ptrCast(@alignCast(ctx));
-        _ = sqlite3.sqlite3_close(s.sqlite_conn);
+        s.last_errcode = sqlite3.sqlite3_close(s.sqlite_conn);
     }
 
     fn createDatabase(ctx: *anyopaque, name: []const u8, opts: DbVTable.CreateDatabaseOpts) Error!void {
@@ -136,10 +155,10 @@ pub const SqliteDb = struct {
         }
     }
 
-    fn rawQueryEvaluate(ctx: *anyopaque, query: *Query) Error!void {
+    fn queryEvaluate(ctx: *anyopaque, query: *Query) Error!void {
         const s: *SqliteDb = @ptrCast(@alignCast(ctx));
 
-        var ret = sqlite3.sqlite3_prepare_v3(
+        s.last_errcode = sqlite3.sqlite3_prepare_v3(
             s.sqlite_conn,
             query.raw_query.ptr,
             query.raw_query.len,
@@ -147,12 +166,12 @@ pub const SqliteDb = struct {
             &s.stmt,
             if (s.next_prepare_opts.tail) |t| @ptrCast(t) else @ptrFromInt(0),
         );
-        if (ret != sqlite3.SQLITE_OK) {
+        if (s.last_errcode != sqlite3.SQLITE_OK) {
             s.getLastErrorMsg();
             return error.StmtPrepareFailed;
         }
         errdefer {
-            _ = sqlite3.sqlite3_finalize(s.stmt);
+            s.last_errcode = sqlite3.sqlite3_finalize(s.stmt);
             query.finalized = true;
         }
 
@@ -174,6 +193,7 @@ pub const SqliteDb = struct {
                     }
                 };
 
+                var ret: usize = 0;
                 switch (bind_arg.value) {
                     .NULL => {
                         ret = sqlite3.sqlite3_bind_null(s.stmt, idx);
@@ -205,7 +225,7 @@ pub const SqliteDb = struct {
         query.prepared = true;
     }
 
-    fn rawQueryNextRow(ctx: *anyopaque) Error!?usize {
+    fn queryNextRow(ctx: *anyopaque) Error!?usize {
         const s: *SqliteDb = @ptrCast(@alignCast(ctx));
         const ret = sqlite3.sqlite3_step(s.stmt);
         switch (ret) {
@@ -234,7 +254,7 @@ pub const SqliteDb = struct {
         }
     }
 
-    fn rawQueryNextCol(ctx: *anyopaque, row: *QueryRow, col_idx: usize) Error!?QueryCol {
+    fn queryNextCol(ctx: *anyopaque, row: *QueryRow, col_idx: usize) Error!?QueryCol {
         const s: *SqliteDb = @ptrCast(@alignCast(ctx));
 
         const name = brk: {
@@ -304,6 +324,57 @@ pub const SqliteDb = struct {
             },
             else => unreachable,
         }
+    }
+
+    fn queryFinalize(ctx: *anyopaque, query: *Query) usize {
+        const s: *SqliteDb = @ptrCast(@alignCast(ctx));
+        s.last_errcode = sqlite3.sqlite3_finalize(s.stmt);
+        s.stmt = @ptrFromInt(0);
+        s.row_fetched = 0;
+        query.finalized = true;
+        return s.last_errcode;
+    }
+
+    fn migrate(ctx: *anyopaque, db: *Db, migration: *Migration) Error!void {
+        const s: *SqliteDb = @ptrCast(@alignCast(ctx));
+        const maybe_change_set = try migration.up();
+        if (maybe_change_set) |*change_set| {
+            defer change_set.deinit();
+            try db.queryExecuteSlice(s.allocator, "BEGIN TRANSACTION");
+            errdefer {
+                db.queryExecuteSlice(s.allocator, "ROLLBACK") catch |err| {
+                    std.debug.print("Rollback failed: {any}\n", .{err});
+                };
+            }
+            for (0..change_set.query_len) |i| {
+                try db.queryExecute(&change_set.query_buf[i]);
+            }
+            // TODO: need to update meta table
+            try db.queryExecuteSlice(s.allocator, "COMMIT");
+        }
+    }
+
+    fn createTable(ctx: *anyopaque, db: *Db, table_name: []const u8, col_names: [][]const u8, col_types: []ValueType, opts: DbVTable.CreateTableOpts) Error!Query {
+        const s: *SqliteDb = @ptrCast(@alignCast(ctx));
+        _ = opts;
+        var sql_buf = std.ArrayList(u8).init(s.allocator);
+        defer sql_buf.deinit();
+        const sql_writer = sql_buf.writer();
+        std.debug.assert(col_names.len == col_types.len);
+        try sql_writer.print("CREATE TABLE '{s}' (", .{table_name});
+        for (0..col_names.len) |i| {
+            if (i > 0) {
+                try sql_writer.print(" ,", .{});
+            }
+            try sql_writer.print("'{s}' {s}", .{ col_names[i], valueTypeToSqlite3Type(col_types[i]) });
+        }
+        try sql_writer.print(")", .{});
+        return Query{
+            .allocator = s.allocator,
+            .db = db,
+            .raw_query = try sql_buf.toOwnedSliceSentinel(0),
+            .raw_bind_args = null,
+        };
     }
 
     // extern interfaces of sqlite3
@@ -406,8 +477,7 @@ pub const SqliteDb = struct {
     };
 };
 
-test "sqlite3" {
-    const testing = std.testing;
+test "query" {
     var sdb = try SqliteDb.init(testing.allocator, ":memory:", .{});
     defer sdb.deinit();
     var db: Db = sdb.getDb();
@@ -529,5 +599,61 @@ test "sqlite3" {
             Record{ .count = 4 },
             Record{ .count = 5 },
         }, records);
+    }
+}
+
+test "migration" {
+    var sdb = try SqliteDb.init(testing.allocator, ":memory:", .{});
+    defer sdb.deinit();
+    var db: Db = sdb.getDb();
+    try db.open();
+    defer db.close();
+    var output_buf = std.ArrayList(u8).init(testing.allocator);
+    defer output_buf.deinit();
+    const output_writer = output_buf.writer();
+    _ = output_writer;
+    {
+        const User = struct {
+            id: i64,
+            name: []const u8,
+            sex: bool,
+        };
+
+        const MyMigration = struct {
+            allocator: std.mem.Allocator,
+            db: *Db,
+
+            const Self = @This();
+
+            pub fn getMigration(this: *Self) Migration {
+                return Migration{
+                    .id = "1",
+                    .ctx = this,
+                    .vtable = .{
+                        .up = up,
+                        .down = down,
+                    },
+                };
+            }
+
+            // vtable fns
+            fn up(ctx: *anyopaque) Error!?ChangeSet {
+                const m: *Self = @ptrCast(@alignCast(ctx));
+                var change_set = try ChangeSet.init(m.allocator);
+                const user_table = Schema.table(User);
+                try change_set.append(try m.db.createTable(user_table, .{}));
+                return change_set;
+            }
+
+            fn down(ctx: *anyopaque) Error!?ChangeSet {
+                const m: *Self = @ptrCast(@alignCast(ctx));
+                _ = m;
+                return null;
+            }
+        };
+
+        var my_migration = MyMigration{ .allocator = testing.allocator, .db = &db };
+        var migration = my_migration.getMigration();
+        try db.migrate(&migration);
     }
 }

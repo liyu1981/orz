@@ -74,6 +74,10 @@ pub const SqliteDb = struct {
                 .implMigrate = migrate,
                 .implCreateTable = createTable,
                 .implDropTable = dropTable,
+                .implRenameTable = renameTable,
+                .implAddColumn = addColumn,
+                .implDropColumn = dropColumn,
+                .implRenameColumn = renameColumn,
             },
         };
     }
@@ -360,7 +364,7 @@ pub const SqliteDb = struct {
         }
     }
 
-    fn createTable(ctx: *anyopaque, db: *Db, table_name: []const u8, col_names: [][]const u8, col_types: []ValueType, opts: DbVTable.CreateTableOpts) Error!Query {
+    fn createTable(ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, col_names: [][]const u8, col_types: []ValueType, opts: DbVTable.CreateTableOpts) Error!void {
         const s: *SqliteDb = @ptrCast(@alignCast(ctx));
         _ = opts;
         var sql_buf = std.ArrayList(u8).init(s.allocator);
@@ -375,27 +379,81 @@ pub const SqliteDb = struct {
             try sql_writer.print("'{s}' {s}", .{ col_names[i], valueTypeToSqlite3Type(col_types[i]) });
         }
         try sql_writer.print(")", .{});
-        return Query{
+        try change_set.append(Query{
             .allocator = s.allocator,
             .db = db,
             .raw_query = try sql_buf.toOwnedSliceSentinel(0),
-            .raw_bind_args = null,
-        };
+        });
     }
 
-    fn dropTable(ctx: *anyopaque, db: *Db, table_name: []const u8, opts: DbVTable.DropTableOpts) Error!Query {
+    fn dropTable(ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, opts: DbVTable.DropTableOpts) Error!void {
         const s: *SqliteDb = @ptrCast(@alignCast(ctx));
         _ = opts;
         var sql_buf = std.ArrayList(u8).init(s.allocator);
         defer sql_buf.deinit();
         const sql_writer = sql_buf.writer();
         try sql_writer.print("DROP TABLE '{s}'", .{table_name});
-        return Query{
+        try change_set.append(Query{
             .allocator = s.allocator,
             .db = db,
             .raw_query = try sql_buf.toOwnedSliceSentinel(0),
-            .raw_bind_args = null,
-        };
+        });
+    }
+
+    fn renameTable(ctx: *anyopaque, db: *Db, change_set: *ChangeSet, from_table_name: []const u8, to_table_name: []const u8, opts: DbVTable.RenameTableOpts) Error!void {
+        const s: *SqliteDb = @ptrCast(@alignCast(ctx));
+        _ = opts;
+        var sql_buf = std.ArrayList(u8).init(s.allocator);
+        defer sql_buf.deinit();
+        const sql_writer = sql_buf.writer();
+        try sql_writer.print("ALTER TABLE '{s}' RENAME TO '{s}'", .{ from_table_name, to_table_name });
+        try change_set.append(Query{
+            .allocator = s.allocator,
+            .db = db,
+            .raw_query = try sql_buf.toOwnedSliceSentinel(0),
+        });
+    }
+
+    fn addColumn(ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, col_name: []const u8, col_type: ValueType, opts: DbVTable.AddColumnOpts) Error!void {
+        const s: *SqliteDb = @ptrCast(@alignCast(ctx));
+        _ = opts;
+        var sql_buf = std.ArrayList(u8).init(s.allocator);
+        defer sql_buf.deinit();
+        const sql_writer = sql_buf.writer();
+        try sql_writer.print("ALTER TABLE '{s}' ADD '{s}' {s}", .{ table_name, col_name, valueTypeToSqlite3Type(col_type) });
+        try change_set.append(Query{
+            .allocator = s.allocator,
+            .db = db,
+            .raw_query = try sql_buf.toOwnedSliceSentinel(0),
+        });
+    }
+
+    fn dropColumn(ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, col_name: []const u8, opts: DbVTable.DropColumnOpts) Error!void {
+        const s: *SqliteDb = @ptrCast(@alignCast(ctx));
+        _ = opts;
+        var sql_buf = std.ArrayList(u8).init(s.allocator);
+        defer sql_buf.deinit();
+        const sql_writer = sql_buf.writer();
+        try sql_writer.print("ALTER TABLE '{s}' DROP '{s}'", .{ table_name, col_name });
+        try change_set.append(Query{
+            .allocator = s.allocator,
+            .db = db,
+            .raw_query = try sql_buf.toOwnedSliceSentinel(0),
+        });
+    }
+
+    fn renameColumn(ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, from_col_name: []const u8, to_col_name: []const u8, opts: DbVTable.RenameColumnOpts) Error!void {
+        const s: *SqliteDb = @ptrCast(@alignCast(ctx));
+        _ = opts;
+        var sql_buf = std.ArrayList(u8).init(s.allocator);
+        defer sql_buf.deinit();
+        const sql_writer = sql_buf.writer();
+        try sql_writer.print("ALTER TABLE '{s}' RENAME COLUMN '{s}' TO '{s}'", .{ table_name, from_col_name, to_col_name });
+        try change_set.append(Query{
+            .allocator = s.allocator,
+            .db = db,
+            .raw_query = try sql_buf.toOwnedSliceSentinel(0),
+        });
     }
 
     // extern interfaces of sqlite3
@@ -497,6 +555,8 @@ pub const SqliteDb = struct {
         extern fn sqlite3_bind_parameter_index(pStmt: *allowzero anyopaque, zName: [*c]const u8) usize;
     };
 };
+
+// tests
 
 test "query" {
     var sdb = try SqliteDb.init(testing.allocator, ":memory:", .{});
@@ -624,27 +684,22 @@ test "query" {
 }
 
 test "migration" {
-    var sdb = try SqliteDb.init(testing.allocator, ":memory:", .{});
-    defer sdb.deinit();
-    var db: Db = sdb.getDb();
-    try db.open();
-    defer db.close();
-    var output_buf = std.ArrayList(u8).init(testing.allocator);
-    defer output_buf.deinit();
-    const output_writer = output_buf.writer();
-    _ = output_writer;
-    {
-        const User = struct {
-            id: i64,
-            name: []const u8,
-            sex: bool,
-        };
+    const User = struct {
+        id: i64,
+        name: []const u8,
+        sex: bool,
+    };
 
+    {
+        var sdb = try SqliteDb.init(testing.allocator, ":memory:", .{});
+        defer sdb.deinit();
+        var db: Db = sdb.getDb();
+        try db.open();
+        defer db.close();
         const MyMigration = struct {
+            const Self = @This();
             allocator: std.mem.Allocator,
             db: *Db,
-
-            const Self = @This();
 
             pub fn getMigration(this: *Self) Migration {
                 return Migration{
@@ -662,7 +717,7 @@ test "migration" {
                 const m: *Self = @ptrCast(@alignCast(ctx));
                 var change_set = try ChangeSet.init(m.allocator);
                 const user_table = Schema.table(User);
-                try change_set.append(try m.db.createTable(user_table, .{}));
+                try m.db.createTable(&change_set, user_table, .{});
                 return change_set;
             }
 
@@ -670,7 +725,7 @@ test "migration" {
                 const m: *Self = @ptrCast(@alignCast(ctx));
                 var change_set = try ChangeSet.init(m.allocator);
                 const user_table = Schema.table(User);
-                try change_set.append(try m.db.dropTable(user_table, .{}));
+                try m.db.dropTable(&change_set, user_table, .{});
                 return change_set;
             }
         };
@@ -679,5 +734,153 @@ test "migration" {
         var migration = my_migration.getMigration();
         try db.migrateUp(&migration);
         try db.migrateDown(&migration);
+    }
+
+    {
+        var sdb = try SqliteDb.init(testing.allocator, ":memory:", .{});
+        defer sdb.deinit();
+        var db: Db = sdb.getDb();
+        try db.open();
+        defer db.close();
+        const MyMigration = struct {
+            const Self = @This();
+            allocator: std.mem.Allocator,
+            db: *Db,
+
+            pub fn getMigration(this: *Self) Migration {
+                return Migration{
+                    .id = "1",
+                    .ctx = this,
+                    .vtable = .{
+                        .up = up,
+                    },
+                };
+            }
+
+            // vtable fns
+            fn up(ctx: *anyopaque) Error!?ChangeSet {
+                const m: *Self = @ptrCast(@alignCast(ctx));
+                var change_set = try ChangeSet.init(m.allocator);
+                const user_table = Schema.table(User);
+                try m.db.createTable(&change_set, user_table, .{});
+                try m.db.addColumn(&change_set, user_table.table_name, "nickname", ValueType.getUndefined([]const u8), .{});
+                return change_set;
+            }
+        };
+
+        var my_migration = MyMigration{ .allocator = testing.allocator, .db = &db };
+        var migration = my_migration.getMigration();
+        try db.migrateUp(&migration);
+    }
+
+    {
+        var sdb = try SqliteDb.init(testing.allocator, ":memory:", .{});
+        defer sdb.deinit();
+        var db: Db = sdb.getDb();
+        try db.open();
+        defer db.close();
+        const MyMigration = struct {
+            const Self = @This();
+            allocator: std.mem.Allocator,
+            db: *Db,
+
+            pub fn getMigration(this: *Self) Migration {
+                return Migration{
+                    .id = "1",
+                    .ctx = this,
+                    .vtable = .{
+                        .up = up,
+                    },
+                };
+            }
+
+            // vtable fns
+            fn up(ctx: *anyopaque) Error!?ChangeSet {
+                const m: *Self = @ptrCast(@alignCast(ctx));
+                var change_set = try ChangeSet.init(m.allocator);
+                const user_table = Schema.table(User);
+                try m.db.createTable(&change_set, user_table, .{});
+                try m.db.dropColumn(&change_set, user_table.table_name, "name", .{});
+                return change_set;
+            }
+        };
+
+        var my_migration = MyMigration{ .allocator = testing.allocator, .db = &db };
+        var migration = my_migration.getMigration();
+        try db.migrateUp(&migration);
+    }
+
+    {
+        var sdb = try SqliteDb.init(testing.allocator, ":memory:", .{});
+        defer sdb.deinit();
+        var db: Db = sdb.getDb();
+        try db.open();
+        defer db.close();
+        const MyMigration = struct {
+            const Self = @This();
+            allocator: std.mem.Allocator,
+            db: *Db,
+
+            pub fn getMigration(this: *Self) Migration {
+                return Migration{
+                    .id = "1",
+                    .ctx = this,
+                    .vtable = .{
+                        .up = up,
+                    },
+                };
+            }
+
+            // vtable fns
+            fn up(ctx: *anyopaque) Error!?ChangeSet {
+                const m: *Self = @ptrCast(@alignCast(ctx));
+                var change_set = try ChangeSet.init(m.allocator);
+                const user_table = Schema.table(User);
+                try m.db.createTable(&change_set, user_table, .{});
+                try m.db.renameTable(&change_set, user_table.table_name, "user_renamed", .{});
+                return change_set;
+            }
+        };
+
+        var my_migration = MyMigration{ .allocator = testing.allocator, .db = &db };
+        var migration = my_migration.getMigration();
+        try db.migrateUp(&migration);
+    }
+
+    {
+        var sdb = try SqliteDb.init(testing.allocator, ":memory:", .{});
+        defer sdb.deinit();
+        var db: Db = sdb.getDb();
+        try db.open();
+        defer db.close();
+        const MyMigration = struct {
+            const Self = @This();
+            allocator: std.mem.Allocator,
+            db: *Db,
+
+            pub fn getMigration(this: *Self) Migration {
+                return Migration{
+                    .id = "1",
+                    .ctx = this,
+                    .vtable = .{
+                        .up = up,
+                    },
+                };
+            }
+
+            // vtable fns
+            fn up(ctx: *anyopaque) Error!?ChangeSet {
+                const m: *Self = @ptrCast(@alignCast(ctx));
+                var change_set = try ChangeSet.init(m.allocator);
+                const user_table = Schema.table(User);
+                try m.db.createTable(&change_set, user_table, .{});
+                try m.db.renameColumn(&change_set, user_table.table_name, "name", "nickname", .{});
+                return change_set;
+            }
+        };
+
+        var my_migration = MyMigration{ .allocator = testing.allocator, .db = &db };
+        var migration = my_migration.getMigration();
+        try db.migrateUp(&migration);
     }
 }

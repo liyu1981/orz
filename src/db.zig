@@ -188,7 +188,7 @@ pub const Query = struct {
     allocator: std.mem.Allocator,
     db: *Db,
     raw_query: [:0]const u8,
-    raw_bind_args: ?[]const QueryArg,
+    raw_bind_args: ?[]const QueryArg = null,
     prepared: bool = false,
     finalized: bool = false,
     col_count: usize = 0,
@@ -395,8 +395,8 @@ pub const ChangeSet = struct {
 
 pub const Migration = struct {
     pub const VTable = struct {
-        up: *const fn (ctx: *anyopaque) Error!?ChangeSet,
-        down: *const fn (ctx: *anyopaque) Error!?ChangeSet,
+        up: ?*const fn (ctx: *anyopaque) Error!?ChangeSet = null,
+        down: ?*const fn (ctx: *anyopaque) Error!?ChangeSet = null,
     };
 
     id: []const u8,
@@ -404,11 +404,15 @@ pub const Migration = struct {
     vtable: VTable,
 
     pub inline fn up(this: *Migration) Error!?ChangeSet {
-        return this.vtable.up(this.ctx);
+        if (this.vtable.up) |upfn| {
+            return upfn(this.ctx);
+        } else return null;
     }
 
     pub inline fn down(this: *Migration) Error!?ChangeSet {
-        return this.vtable.down(this.ctx);
+        if (this.vtable.down) |downfn| {
+            return downfn(this.ctx);
+        } else return null;
     }
 };
 
@@ -422,6 +426,10 @@ pub const DbVTable = struct {
     pub const MigrateDirection = enum { up, down };
     pub const CreateTableOpts = struct {};
     pub const DropTableOpts = struct {};
+    pub const RenameTableOpts = struct {};
+    pub const AddColumnOpts = struct {};
+    pub const DropColumnOpts = struct {};
+    pub const RenameColumnOpts = struct {};
 
     implOpen: *const fn (ctx: *anyopaque) Error!void,
     implClose: *const fn (ctx: *anyopaque) void,
@@ -435,8 +443,12 @@ pub const DbVTable = struct {
     implQueryFinalize: *const fn (ctx: *anyopaque, query: *Query) usize,
 
     implMigrate: *const fn (ctx: *anyopaque, db: *Db, migration: *Migration, direction: MigrateDirection) Error!void,
-    implCreateTable: *const fn (ctx: *anyopaque, db: *Db, table_name: []const u8, col_names: [][]const u8, col_types: []ValueType, opts: CreateTableOpts) Error!Query,
-    implDropTable: *const fn (ctx: *anyopaque, db: *Db, table_name: []const u8, opts: DropTableOpts) Error!Query,
+    implCreateTable: *const fn (ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, col_names: [][]const u8, col_types: []ValueType, opts: CreateTableOpts) Error!void,
+    implDropTable: *const fn (ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, opts: DropTableOpts) Error!void,
+    implRenameTable: *const fn (ctx: *anyopaque, db: *Db, chagne_set: *ChangeSet, from_table_name: []const u8, to_table_name: []const u8, opts: RenameTableOpts) Error!void,
+    implAddColumn: *const fn (ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, col_name: []const u8, col_type: ValueType, opts: AddColumnOpts) Error!void,
+    implDropColumn: *const fn (ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, col_name: []const u8, opts: DropColumnOpts) Error!void,
+    implRenameColumn: *const fn (ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, from_col_name: []const u8, to_col_name: []const u8, opts: RenameColumnOpts) Error!void,
 };
 
 pub const Db = struct {
@@ -481,11 +493,11 @@ pub const Db = struct {
     }
 
     pub inline fn migrateUp(this: *Db, migration: *Migration) Error!void {
-        return try this.vtable.implMigrate(this.ctx, this, migration, .up);
+        try this.vtable.implMigrate(this.ctx, this, migration, .up);
     }
 
     pub inline fn migrateDown(this: *Db, migration: *Migration) Error!void {
-        return try this.vtable.implMigrate(this.ctx, this, migration, .down);
+        try this.vtable.implMigrate(this.ctx, this, migration, .down);
     }
 
     // wrappers
@@ -508,11 +520,27 @@ pub const Db = struct {
 
     // migration fns
 
-    pub fn createTable(this: *Db, ent: anytype, opts: DbVTable.CreateTableOpts) Error!Query {
-        return try this.vtable.implCreateTable(this.ctx, this, ent.table_name, ent.col_names, ent.col_types, opts);
+    pub fn createTable(this: *Db, change_set: *ChangeSet, ent: anytype, opts: DbVTable.CreateTableOpts) Error!void {
+        try this.vtable.implCreateTable(this.ctx, this, change_set, ent.table_name, ent.col_names, ent.col_types, opts);
     }
 
-    pub fn dropTable(this: *Db, ent: anytype, opts: DbVTable.DropTableOpts) Error!Query {
-        return try this.vtable.implDropTable(this.ctx, this, ent.table_name, opts);
+    pub fn dropTable(this: *Db, change_set: *ChangeSet, ent: anytype, opts: DbVTable.DropTableOpts) Error!void {
+        try this.vtable.implDropTable(this.ctx, this, change_set, ent.table_name, opts);
+    }
+
+    pub fn renameTable(this: *Db, change_set: *ChangeSet, from_table_name: []const u8, to_table_name: []const u8, opts: DbVTable.RenameTableOpts) Error!void {
+        try this.vtable.implRenameTable(this.ctx, this, change_set, from_table_name, to_table_name, opts);
+    }
+
+    pub fn addColumn(this: *Db, change_set: *ChangeSet, table_name: []const u8, col_name: []const u8, col_type: ValueType, opts: DbVTable.AddColumnOpts) Error!void {
+        try this.vtable.implAddColumn(this.ctx, this, change_set, table_name, col_name, col_type, opts);
+    }
+
+    pub fn dropColumn(this: *Db, change_set: *ChangeSet, table_name: []const u8, col_name: []const u8, opts: DbVTable.DropColumnOpts) Error!void {
+        try this.vtable.implDropColumn(this.ctx, this, change_set, table_name, col_name, opts);
+    }
+
+    pub fn renameColumn(this: *Db, change_set: *ChangeSet, table_name: []const u8, from_col_name: []const u8, to_col_name: []const u8, opts: DbVTable.RenameColumnOpts) Error!void {
+        try this.vtable.implRenameColumn(this.ctx, this, change_set, table_name, from_col_name, to_col_name, opts);
     }
 };

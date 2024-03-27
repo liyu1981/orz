@@ -73,6 +73,7 @@ pub const SqliteDb = struct {
                 .implQueryFinalize = queryFinalize,
                 .implMigrate = migrate,
                 .implCreateTable = createTable,
+                .implDropTable = dropTable,
             },
         };
     }
@@ -335,9 +336,14 @@ pub const SqliteDb = struct {
         return s.last_errcode;
     }
 
-    fn migrate(ctx: *anyopaque, db: *Db, migration: *Migration) Error!void {
+    fn migrate(ctx: *anyopaque, db: *Db, migration: *Migration, direction: DbVTable.MigrateDirection) Error!void {
         const s: *SqliteDb = @ptrCast(@alignCast(ctx));
-        const maybe_change_set = try migration.up();
+        const maybe_change_set = brk: {
+            switch (direction) {
+                .up => break :brk try migration.up(),
+                .down => break :brk try migration.down(),
+            }
+        };
         if (maybe_change_set) |*change_set| {
             defer change_set.deinit();
             try db.queryExecuteSlice(s.allocator, "BEGIN TRANSACTION");
@@ -369,6 +375,21 @@ pub const SqliteDb = struct {
             try sql_writer.print("'{s}' {s}", .{ col_names[i], valueTypeToSqlite3Type(col_types[i]) });
         }
         try sql_writer.print(")", .{});
+        return Query{
+            .allocator = s.allocator,
+            .db = db,
+            .raw_query = try sql_buf.toOwnedSliceSentinel(0),
+            .raw_bind_args = null,
+        };
+    }
+
+    fn dropTable(ctx: *anyopaque, db: *Db, table_name: []const u8, opts: DbVTable.DropTableOpts) Error!Query {
+        const s: *SqliteDb = @ptrCast(@alignCast(ctx));
+        _ = opts;
+        var sql_buf = std.ArrayList(u8).init(s.allocator);
+        defer sql_buf.deinit();
+        const sql_writer = sql_buf.writer();
+        try sql_writer.print("DROP TABLE '{s}'", .{table_name});
         return Query{
             .allocator = s.allocator,
             .db = db,
@@ -647,13 +668,16 @@ test "migration" {
 
             fn down(ctx: *anyopaque) Error!?ChangeSet {
                 const m: *Self = @ptrCast(@alignCast(ctx));
-                _ = m;
-                return null;
+                var change_set = try ChangeSet.init(m.allocator);
+                const user_table = Schema.table(User);
+                try change_set.append(try m.db.dropTable(user_table, .{}));
+                return change_set;
             }
         };
 
         var my_migration = MyMigration{ .allocator = testing.allocator, .db = &db };
         var migration = my_migration.getMigration();
-        try db.migrate(&migration);
+        try db.migrateUp(&migration);
+        try db.migrateDown(&migration);
     }
 }

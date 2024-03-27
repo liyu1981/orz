@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const verbose = true;
+
 pub const Error = error{
     DbConnFailed,
     DbUseDatabaseFailed,
@@ -417,7 +419,9 @@ pub const DbVTable = struct {
         auto_use: bool = true,
         error_if_exist: bool = true,
     };
+    pub const MigrateDirection = enum { up, down };
     pub const CreateTableOpts = struct {};
+    pub const DropTableOpts = struct {};
 
     implOpen: *const fn (ctx: *anyopaque) Error!void,
     implClose: *const fn (ctx: *anyopaque) void,
@@ -430,8 +434,9 @@ pub const DbVTable = struct {
     implQueryNextCol: *const fn (ctx: *anyopaque, row: *QueryRow, col_idx: usize) Error!?QueryCol,
     implQueryFinalize: *const fn (ctx: *anyopaque, query: *Query) usize,
 
-    implMigrate: *const fn (ctx: *anyopaque, db: *Db, migration: *Migration) Error!void,
+    implMigrate: *const fn (ctx: *anyopaque, db: *Db, migration: *Migration, direction: MigrateDirection) Error!void,
     implCreateTable: *const fn (ctx: *anyopaque, db: *Db, table_name: []const u8, col_names: [][]const u8, col_types: []ValueType, opts: CreateTableOpts) Error!Query,
+    implDropTable: *const fn (ctx: *anyopaque, db: *Db, table_name: []const u8, opts: DropTableOpts) Error!Query,
 };
 
 pub const Db = struct {
@@ -457,7 +462,9 @@ pub const Db = struct {
     }
 
     pub inline fn queryEvaluate(this: *Db, query: *Query) Error!void {
-        std.debug.print("evaluate query: {s}\n", .{query.raw_query});
+        if (verbose) {
+            std.debug.print("evaluate query: {s}\n", .{query.raw_query});
+        }
         try this.vtable.implQueryEvaluate(this.ctx, query);
     }
 
@@ -473,8 +480,12 @@ pub const Db = struct {
         return this.vtable.implQueryFinalize(this.ctx, query);
     }
 
-    pub inline fn migrate(this: *Db, migration: *Migration) Error!void {
-        return try this.vtable.implMigrate(this.ctx, this, migration);
+    pub inline fn migrateUp(this: *Db, migration: *Migration) Error!void {
+        return try this.vtable.implMigrate(this.ctx, this, migration, .up);
+    }
+
+    pub inline fn migrateDown(this: *Db, migration: *Migration) Error!void {
+        return try this.vtable.implMigrate(this.ctx, this, migration, .down);
     }
 
     // wrappers
@@ -499,5 +510,9 @@ pub const Db = struct {
 
     pub fn createTable(this: *Db, ent: anytype, opts: DbVTable.CreateTableOpts) Error!Query {
         return try this.vtable.implCreateTable(this.ctx, this, ent.table_name, ent.col_names, ent.col_types, opts);
+    }
+
+    pub fn dropTable(this: *Db, ent: anytype, opts: DbVTable.DropTableOpts) Error!Query {
+        return try this.vtable.implDropTable(this.ctx, this, ent.table_name, opts);
     }
 };

@@ -519,7 +519,7 @@ pub const QueryRow = struct {
             if (to_fetch_col_idx >= this.row.q.col_count) {
                 return null;
             }
-            const maybe_colpair = try this.row.q.db.rawQueryNextCol(this.row, to_fetch_col_idx);
+            const maybe_colpair = try this.row.q.db.queryNextCol(this.row, to_fetch_col_idx);
             if (maybe_colpair) |colpair| {
                 this.fetched_col_count += 1;
                 return QueryCol{
@@ -543,7 +543,7 @@ pub const QueryRow = struct {
     }
 
     pub fn getColAtIdx(this: *QueryRow, idx: usize) !?QueryCol {
-        const maybe_colpair = try this.q.db.rawQueryNextCol(this, idx);
+        const maybe_colpair = try this.q.db.queryNextCol(this, idx);
         if (maybe_colpair) |colpair| {
             return QueryCol{
                 .allocator = colpair.allocator,

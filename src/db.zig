@@ -2,6 +2,40 @@ const std = @import("std");
 
 const verbose = true;
 
+// utils
+
+inline fn isTuple(comptime T: type) bool {
+    switch (@typeInfo(T)) {
+        .Struct => |s| return s.is_tuple,
+        else => return false,
+    }
+}
+
+inline fn isStruct(comptime T: type) bool {
+    switch (@typeInfo(T)) {
+        .Struct => |s| return !s.is_tuple,
+        else => return false,
+    }
+}
+
+inline fn isStringLiteral(comptime T: type) bool {
+    switch (@typeInfo(T)) {
+        .Pointer => |p| {
+            // TODO: is this enough?
+            const cti = @typeInfo(p.child);
+            switch (cti) {
+                .Array => |a| {
+                    return a.child == u8;
+                },
+                else => return false,
+            }
+        },
+        else => return false,
+    }
+}
+
+// general errors for db related fns
+
 pub const Error = error{
     DbConnFailed,
     DbUseDatabaseFailed,
@@ -37,7 +71,31 @@ pub const DataType = enum {
 
 // schema & create
 
-pub const Schema = struct {
+pub const TableSchema = struct {
+    table_name: []const u8 = undefined,
+    col_names: [][]const u8 = undefined,
+    col_types: []ValueType = undefined,
+    primary_key_names: [][]const u8 = undefined,
+    has_foreign_key: bool = false,
+    foreign_key_names: [][]const u8 = undefined,
+    foreign_key_target_table_names: [][]const u8 = undefined,
+    foreign_key_target_col_names: [][]const u8 = undefined,
+    foreign_key_relation_optss: []RelationOpts = undefined,
+    has_indexes: bool = false,
+    index_names: [][]const u8 = undefined,
+    index_keys: [][]const u8 = undefined,
+    index_optss: []IndexOpts = undefined,
+};
+
+pub const RelationOpts = struct {
+    cardinality: enum { one_to_one, one_to_many } = .one_to_one,
+    delete_action: enum { cascade, restrict, no_action, set_null, set_default } = .cascade,
+    update_action: enum { cascade, restrict, no_action, set_null, set_default } = .cascade,
+};
+
+pub const IndexOpts = struct {};
+
+pub const SchemaUtil = struct {
     fn checkEntDef(comptime EntType: type) void {
         const ti = @typeInfo(EntType);
         const vt = @typeInfo(ValueType).Union;
@@ -65,38 +123,223 @@ pub const Schema = struct {
         }
     }
 
-    pub fn defineTable(comptime EntType: type) type {
-        const MAX_COLS = 8192;
-        const fields = @typeInfo(EntType).Struct.fields;
-        comptime var count: usize = 0;
-        comptime var ent_col_names: [MAX_COLS][]const u8 = undefined;
-        comptime var ent_col_types: [MAX_COLS]ValueType = undefined;
-        inline for (fields) |field| {
-            ent_col_names[count] = field.name;
-            ent_col_types[count] = ValueType.getUndefined(field.type);
-            count += 1;
+    fn getLastTypeName(comptime EntType: type) []const u8 {
+        const full_type_name = @typeName(EntType);
+        var it = std.mem.splitBackwardsAny(u8, full_type_name, ".");
+        if (it.next()) |last_name| {
+            return last_name;
+        } else {
+            @panic("Impossible, no last name fragment?:" ++ full_type_name);
         }
-        const tname = comptime brk: {
-            const full_type_name = @typeName(EntType);
-            var it = std.mem.splitBackwardsAny(u8, full_type_name, ".");
-            if (it.next()) |last_name| {
-                break :brk last_name;
+    }
+
+    fn assertValidRelationTuple(table_name: []const u8, i: usize, decl_relation: anytype) void {
+        comptime var buf: [1024]u8 = undefined;
+        const str_i = std.fmt.bufPrintIntToSlice(&buf, i, 10, .lower, .{});
+        if (!isStringLiteral(@TypeOf(decl_relation[0]))) {
+            @compileError(table_name ++ " entry " ++ str_i ++ " with wrong type at item 0, expect string literal(*const [?:0]u8), found " ++ @typeName(@TypeOf(decl_relation[0])));
+        }
+        if (!isStruct(decl_relation[1])) {
+            @compileError(table_name ++ " entry " ++ str_i ++ " with wrong type at item 1, expect Struct, found " ++ @typeName(decl_relation[1]));
+        }
+        if (!isStringLiteral(@TypeOf(decl_relation[2]))) {
+            @compileError(table_name ++ " entry " ++ str_i ++ " with wrong type at item 2, expect string literal(*const [?:0]u8), found " ++ @typeName(@TypeOf(decl_relation[2])));
+        }
+        if (!isStruct(@TypeOf(decl_relation[3]))) {
+            @compileError(table_name ++ " entry " ++ str_i ++ " with wrong type at item 3, expect Struct, found " ++ @typeName(decl_relation[3]));
+        }
+    }
+
+    fn calcForeignKeyName(table_name: []const u8, i: usize, decl_relation: anytype) []const u8 {
+        if (!isTuple(@TypeOf(decl_relation))) {
+            @compileError("each entry in relations must be tuple, fund:" ++ @typeName(@TypeOf(decl_relation)));
+        }
+        assertValidRelationTuple(table_name, i, decl_relation);
+        const target_table_name = getLastTypeName(decl_relation[1]);
+        return "fk_" ++ table_name ++ "_" ++ target_table_name ++ "_" ++ decl_relation[2];
+    }
+
+    fn calcForeignKeyArrays(
+        comptime table_name: []const u8,
+        comptime decl_relations: anytype,
+        comptime fk_names: [][]const u8,
+        comptime fk_target_table_names: [][]const u8,
+        comptime fk_target_col_names: [][]const u8,
+        comptime fk_relation_optss: []RelationOpts,
+    ) void {
+        if (!isTuple(@TypeOf(decl_relations))) {
+            @compileError("relations must be tuple, fund:" ++ @typeName(@TypeOf(decl_relations)));
+        }
+        inline for (0..decl_relations.len) |i| {
+            fk_names[i] = calcForeignKeyName(table_name, i, decl_relations[i]);
+            fk_target_table_names[i] = getLastTypeName(decl_relations[i][1]);
+            fk_target_col_names[i] = decl_relations[i][2];
+            fk_relation_optss[i] = decl_relations[i][3];
+        }
+    }
+
+    fn calcIndexName(comptime table_name: []const u8, comptime i: usize, comptime decl_index: anytype) []const u8 {
+        _ = i;
+        if (!isTuple(@TypeOf(decl_index))) {
+            @compileError("each entry in indexes must be tuple, fund:" ++ @typeName(@TypeOf(decl_index)));
+        }
+        comptime var final_name: []const u8 = "idx_" ++ table_name;
+        inline for (0..decl_index[0].len) |j| {
+            final_name = final_name ++ "_" ++ decl_index[0][j];
+        }
+        return final_name;
+    }
+
+    fn calcIndexKey(comptime decl_index: anytype) []const u8 {
+        if (!isTuple(@TypeOf(decl_index))) {
+            @compileError("each entry in indexes must be tuple, fund:" ++ @typeName(@TypeOf(decl_index)));
+        }
+        comptime var key: []const u8 = "";
+        inline for (0..decl_index[0].len) |j| {
+            if (j == 0) {
+                key = key ++ decl_index[0][j];
             } else {
-                @panic("Impossible, no last name fragment?:" ++ full_type_name);
+                key = key ++ "," ++ decl_index[0][j];
             }
-        };
-        return struct {
-            table_name: []const u8 = tname,
-            col_names: [][]const u8 = ent_col_names[0..count],
-            col_types: []ValueType = ent_col_types[0..count],
+        }
+        return key;
+    }
+
+    fn calcIndexArrays(
+        comptime table_name: []const u8,
+        comptime decl_indexes: anytype,
+        comptime index_names: [][]const u8,
+        comptime index_keys: [][]const u8,
+        comptime index_optss: []IndexOpts,
+    ) void {
+        if (!isTuple(@TypeOf(decl_indexes))) {
+            @compileError("indexes must be tuple, fund:" ++ @typeName(@TypeOf(decl_indexes)));
+        }
+        inline for (0..decl_indexes.len) |i| {
+            index_names[i] = calcIndexName(table_name, i, decl_indexes[i]);
+            index_keys[i] = calcIndexKey(decl_indexes[i]);
+            index_optss[i] = decl_indexes[i][1];
+        }
+    }
+
+    pub fn calcTableSchema(comptime EntType: type) TableSchema {
+        const ti_struct = @typeInfo(EntType).Struct;
+        const fields = ti_struct.fields;
+        const decls = ti_struct.decls;
+
+        const table_name = getLastTypeName(EntType);
+
+        comptime var ent_col_names: [fields.len][]const u8 = undefined;
+        comptime var ent_col_types: [fields.len]ValueType = undefined;
+        inline for (0..fields.len) |i| {
+            ent_col_names[i] = fields[i].name;
+            ent_col_types[i] = comptime ValueType.getUndefined(fields[i].type);
+        }
+
+        comptime var with_decl_primary_key: bool = false;
+        comptime var with_decl_relations: bool = false;
+        comptime var with_decl_indexes: bool = false;
+        comptime {
+            for (0..decls.len) |i| {
+                if (std.mem.eql(u8, decls[i].name, "relations")) {
+                    with_decl_relations = true;
+                }
+                if (std.mem.eql(u8, decls[i].name, "primary_key")) {
+                    with_decl_primary_key = true;
+                }
+                if (std.mem.eql(u8, decls[i].name, "indexes")) {
+                    with_decl_indexes = true;
+                }
+            }
+        }
+
+        comptime var primary_key_names: [if (with_decl_primary_key) @field(EntType, "primary_key").len else 1][]const u8 = undefined;
+        comptime {
+            if (with_decl_primary_key) {
+                const decl_primary_key = @field(EntType, "primary_key");
+                for (0..decl_primary_key.len) |i| {
+                    primary_key_names[i] = decl_primary_key[i];
+                }
+            } else {
+                // first col will be used as primary key
+                if (ent_col_names.len == 0) {
+                    @compileError(@typeName(EntType) ++ " has no field can be used as primary key!");
+                }
+                primary_key_names[0] = ent_col_names[0];
+            }
+        }
+
+        const has_foreign_key: bool = if (with_decl_relations) @field(EntType, "relations").len > 0 else false;
+        comptime var foreign_key_names: [if (with_decl_relations) @field(EntType, "relations").len else 0][]const u8 = undefined;
+        comptime var foreign_key_target_table_names: [if (with_decl_relations) @field(EntType, "relations").len else 0][]const u8 = undefined;
+        comptime var foreign_key_target_col_names: [if (with_decl_relations) @field(EntType, "relations").len else 0][]const u8 = undefined;
+        comptime var foreign_key_relation_optss: [if (with_decl_relations) @field(EntType, "relations").len else 0]RelationOpts = undefined;
+        comptime {
+            if (has_foreign_key) {
+                calcForeignKeyArrays(
+                    table_name,
+                    @field(EntType, "relations"),
+                    &foreign_key_names,
+                    &foreign_key_target_table_names,
+                    &foreign_key_target_col_names,
+                    &foreign_key_relation_optss,
+                );
+            }
+        }
+
+        const has_indexes = if (with_decl_indexes) @field(EntType, "indexes").len > 0 else false;
+        comptime var index_names: [if (with_decl_indexes) @field(EntType, "indexes").len else 0][]const u8 = undefined;
+        comptime var index_keys: [if (with_decl_indexes) @field(EntType, "indexes").len else 0][]const u8 = undefined;
+        comptime var index_optss: [if (with_decl_indexes) @field(EntType, "indexes").len else 0]IndexOpts = undefined;
+        comptime {
+            if (has_indexes) {
+                calcIndexArrays(
+                    table_name,
+                    @field(EntType, "indexes"),
+                    &index_names,
+                    &index_keys,
+                    &index_optss,
+                );
+            }
+        }
+
+        return TableSchema{
+            .table_name = table_name,
+            .col_names = &ent_col_names,
+            .col_types = &ent_col_types,
+            .primary_key_names = &primary_key_names,
+            .has_foreign_key = has_foreign_key,
+            .foreign_key_names = &foreign_key_names,
+            .foreign_key_target_table_names = &foreign_key_target_table_names,
+            .foreign_key_target_col_names = &foreign_key_target_col_names,
+            .foreign_key_relation_optss = &foreign_key_relation_optss,
+            .has_indexes = has_indexes,
+            .index_names = &index_names,
+            .index_keys = &index_keys,
+            .index_optss = &index_optss,
         };
     }
 
-    pub fn table(comptime EntType: type) defineTable(EntType) {
+    pub fn buildOne(comptime EntType: type) TableSchema {
         checkEntDef(EntType);
-        return defineTable(EntType){};
+        return comptime calcTableSchema(EntType);
+    }
+
+    pub fn build(comptime ent_type_tuple: anytype) [ent_type_tuple.len]TableSchema {
+        if (!isTuple(@TypeOf(ent_type_tuple))) {
+            @compileError("build only accepts a tuple of ent type struct, found:" ++ @typeName(@TypeOf(ent_type_tuple)));
+        }
+        var table_schemas: [ent_type_tuple.len]TableSchema = undefined;
+        inline for (0..ent_type_tuple.len) |i| {
+            table_schemas[i] = SchemaUtil.buildOne(ent_type_tuple[i]);
+        }
+        return table_schemas;
     }
 };
+
+// constraint
+
+pub const Constraint = struct {};
 
 // query
 
@@ -430,6 +673,8 @@ pub const DbVTable = struct {
     pub const AddColumnOpts = struct {};
     pub const DropColumnOpts = struct {};
     pub const RenameColumnOpts = struct {};
+    pub const CreateConstraintOpts = struct {};
+    pub const DropConstraintOpts = struct {};
 
     implOpen: *const fn (ctx: *anyopaque) Error!void,
     implClose: *const fn (ctx: *anyopaque) void,
@@ -449,98 +694,109 @@ pub const DbVTable = struct {
     implAddColumn: *const fn (ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, col_name: []const u8, col_type: ValueType, opts: AddColumnOpts) Error!void,
     implDropColumn: *const fn (ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, col_name: []const u8, opts: DropColumnOpts) Error!void,
     implRenameColumn: *const fn (ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, from_col_name: []const u8, to_col_name: []const u8, opts: RenameColumnOpts) Error!void,
+    implCreateConstraint: *const fn (ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, constraint: Constraint, opts: CreateConstraintOpts) Error!void,
+    implDropConstraint: *const fn (ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, constraint_name: []const u8, opts: DropConstraintOpts) Error!void,
 };
 
-pub const Db = struct {
-    ctx: *anyopaque,
-    vtable: DbVTable,
+// top level Db namespace starts here
 
-    // vtable fn shortcuts
+ctx: *anyopaque,
+vtable: DbVTable,
+const Db = @This();
 
-    pub inline fn open(this: *Db) Error!void {
-        try this.vtable.implOpen(this.ctx);
+// vtable fn shortcuts
+
+pub inline fn open(this: *Db) Error!void {
+    try this.vtable.implOpen(this.ctx);
+}
+
+pub inline fn close(this: *Db) void {
+    this.vtable.implClose(this.ctx);
+}
+
+pub inline fn createDatabase(this: *Db, name: []const u8, opts: DbVTable.CreateDatabaseOpts) Error!void {
+    try this.vtable.implCreateDatabase(this.ctx, name, opts);
+}
+
+pub inline fn useDatabase(this: *Db, name: []const u8) Error!void {
+    try this.vtable.implUseDatabase(this.ctx, name);
+}
+
+pub inline fn queryEvaluate(this: *Db, query: *Query) Error!void {
+    if (verbose) {
+        std.debug.print("evaluate query: {s}\n", .{query.raw_query});
     }
+    try this.vtable.implQueryEvaluate(this.ctx, query);
+}
 
-    pub inline fn close(this: *Db) void {
-        this.vtable.implClose(this.ctx);
-    }
+pub inline fn queryNextRow(this: *Db) Error!?usize {
+    return this.vtable.implQueryNextRow(this.ctx);
+}
 
-    pub inline fn createDatabase(this: *Db, name: []const u8, opts: DbVTable.CreateDatabaseOpts) Error!void {
-        try this.vtable.implCreateDatabase(this.ctx, name, opts);
-    }
+pub inline fn queryNextCol(this: *Db, row: *QueryRow, col_idx: usize) Error!?QueryCol {
+    return this.vtable.implQueryNextCol(this.ctx, row, col_idx);
+}
 
-    pub inline fn useDatabase(this: *Db, name: []const u8) Error!void {
-        try this.vtable.implUseDatabase(this.ctx, name);
-    }
+pub inline fn queryFinalize(this: *Db, query: *Query) usize {
+    return this.vtable.implQueryFinalize(this.ctx, query);
+}
 
-    pub inline fn queryEvaluate(this: *Db, query: *Query) Error!void {
-        if (verbose) {
-            std.debug.print("evaluate query: {s}\n", .{query.raw_query});
-        }
-        try this.vtable.implQueryEvaluate(this.ctx, query);
-    }
+pub inline fn migrateUp(this: *Db, migration: *Migration) Error!void {
+    try this.vtable.implMigrate(this.ctx, this, migration, .up);
+}
 
-    pub inline fn queryNextRow(this: *Db) Error!?usize {
-        return this.vtable.implQueryNextRow(this.ctx);
-    }
+pub inline fn migrateDown(this: *Db, migration: *Migration) Error!void {
+    try this.vtable.implMigrate(this.ctx, this, migration, .down);
+}
 
-    pub inline fn queryNextCol(this: *Db, row: *QueryRow, col_idx: usize) Error!?QueryCol {
-        return this.vtable.implQueryNextCol(this.ctx, row, col_idx);
-    }
+// wrappers
 
-    pub inline fn queryFinalize(this: *Db, query: *Query) usize {
-        return this.vtable.implQueryFinalize(this.ctx, query);
-    }
+pub fn queryExecute(this: *Db, query: *Query) Error!void {
+    try this.queryEvaluate(query);
+    var rit = try query.iterator();
+    _ = try rit.next();
+    query.finalize();
+}
 
-    pub inline fn migrateUp(this: *Db, migration: *Migration) Error!void {
-        try this.vtable.implMigrate(this.ctx, this, migration, .up);
-    }
+pub fn queryExecuteSlice(this: *Db, allocator: std.mem.Allocator, query: []const u8) Error!void {
+    var q = try Query.init(allocator, this, query, null);
+    try this.queryEvaluate(&q);
+    var rit = try q.iterator();
+    _ = try rit.next();
+    q.finalize();
+    q.deinit();
+}
 
-    pub inline fn migrateDown(this: *Db, migration: *Migration) Error!void {
-        try this.vtable.implMigrate(this.ctx, this, migration, .down);
-    }
+// migration fns
 
-    // wrappers
+pub inline fn createTable(this: *Db, change_set: *ChangeSet, ent: TableSchema, opts: DbVTable.CreateTableOpts) Error!void {
+    try this.vtable.implCreateTable(this.ctx, this, change_set, ent.table_name, ent.col_names, ent.col_types, opts);
+}
 
-    pub fn queryExecute(this: *Db, query: *Query) Error!void {
-        try this.queryEvaluate(query);
-        var rit = try query.iterator();
-        _ = try rit.next();
-        query.finalize();
-    }
+pub inline fn dropTable(this: *Db, change_set: *ChangeSet, ent: TableSchema, opts: DbVTable.DropTableOpts) Error!void {
+    try this.vtable.implDropTable(this.ctx, this, change_set, ent.table_name, opts);
+}
 
-    pub fn queryExecuteSlice(this: *Db, allocator: std.mem.Allocator, query: []const u8) Error!void {
-        var q = try Query.init(allocator, this, query, null);
-        try this.queryEvaluate(&q);
-        var rit = try q.iterator();
-        _ = try rit.next();
-        q.finalize();
-        q.deinit();
-    }
+pub inline fn renameTable(this: *Db, change_set: *ChangeSet, from_table_name: []const u8, to_table_name: []const u8, opts: DbVTable.RenameTableOpts) Error!void {
+    try this.vtable.implRenameTable(this.ctx, this, change_set, from_table_name, to_table_name, opts);
+}
 
-    // migration fns
+pub inline fn addColumn(this: *Db, change_set: *ChangeSet, table_name: []const u8, col_name: []const u8, col_type: ValueType, opts: DbVTable.AddColumnOpts) Error!void {
+    try this.vtable.implAddColumn(this.ctx, this, change_set, table_name, col_name, col_type, opts);
+}
 
-    pub fn createTable(this: *Db, change_set: *ChangeSet, ent: anytype, opts: DbVTable.CreateTableOpts) Error!void {
-        try this.vtable.implCreateTable(this.ctx, this, change_set, ent.table_name, ent.col_names, ent.col_types, opts);
-    }
+pub inline fn dropColumn(this: *Db, change_set: *ChangeSet, table_name: []const u8, col_name: []const u8, opts: DbVTable.DropColumnOpts) Error!void {
+    try this.vtable.implDropColumn(this.ctx, this, change_set, table_name, col_name, opts);
+}
 
-    pub fn dropTable(this: *Db, change_set: *ChangeSet, ent: anytype, opts: DbVTable.DropTableOpts) Error!void {
-        try this.vtable.implDropTable(this.ctx, this, change_set, ent.table_name, opts);
-    }
+pub inline fn renameColumn(this: *Db, change_set: *ChangeSet, table_name: []const u8, from_col_name: []const u8, to_col_name: []const u8, opts: DbVTable.RenameColumnOpts) Error!void {
+    try this.vtable.implRenameColumn(this.ctx, this, change_set, table_name, from_col_name, to_col_name, opts);
+}
 
-    pub fn renameTable(this: *Db, change_set: *ChangeSet, from_table_name: []const u8, to_table_name: []const u8, opts: DbVTable.RenameTableOpts) Error!void {
-        try this.vtable.implRenameTable(this.ctx, this, change_set, from_table_name, to_table_name, opts);
-    }
+pub inline fn createConstraint(this: *Db, change_set: *ChangeSet, table_name: []const u8, constraint: Constraint, opts: DbVTable.CreateConstraintOpts) Error!void {
+    try this.vtable.implCreateConstraint(this.ctx, this, change_set, table_name, constraint, opts);
+}
 
-    pub fn addColumn(this: *Db, change_set: *ChangeSet, table_name: []const u8, col_name: []const u8, col_type: ValueType, opts: DbVTable.AddColumnOpts) Error!void {
-        try this.vtable.implAddColumn(this.ctx, this, change_set, table_name, col_name, col_type, opts);
-    }
-
-    pub fn dropColumn(this: *Db, change_set: *ChangeSet, table_name: []const u8, col_name: []const u8, opts: DbVTable.DropColumnOpts) Error!void {
-        try this.vtable.implDropColumn(this.ctx, this, change_set, table_name, col_name, opts);
-    }
-
-    pub fn renameColumn(this: *Db, change_set: *ChangeSet, table_name: []const u8, from_col_name: []const u8, to_col_name: []const u8, opts: DbVTable.RenameColumnOpts) Error!void {
-        try this.vtable.implRenameColumn(this.ctx, this, change_set, table_name, from_col_name, to_col_name, opts);
-    }
-};
+pub inline fn dropConstraint(this: *Db, change_set: *ChangeSet, table_name: []const u8, constraint_name: []const u8, opts: DbVTable.DropConstraintOpts) Error!void {
+    try this.vtable.implDropConstraint(this.ctx, this, change_set, table_name, constraint_name, opts);
+}

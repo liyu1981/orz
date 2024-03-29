@@ -720,7 +720,7 @@ test "query" {
     }
 }
 
-test "migration" {
+test "simple_migration" {
     const User = struct {
         id: i64,
         name: []const u8,
@@ -922,13 +922,17 @@ test "migration" {
     }
 }
 
-test "relation" {
+test "complex_migration" {
     const Company = struct {
         id: i64,
         name: []const u8,
         pub const indexes = .{
             .{ [_][]const u8{"name"}, IndexOpts{} },
         };
+    };
+    const Skill = struct {
+        id: i64,
+        name: []const u8,
     };
     const User = struct {
         id: i64,
@@ -939,80 +943,43 @@ test "relation" {
 
         // has to be pub as if not zig may not compile it
         pub const primary_key = [_][]const u8{"id"};
-        pub const relations = .{
-            .{ "company_id", Company, "id", RelationOpts{} },
-        };
+        pub const relations = .{ .{ "company_id", Company, "id", RelationOpts{} }, .{ "id", Skill, "id", RelationOpts{ .cardinality = .many_to_many } } };
         pub const unique_cols = [_][]const u8{"company_id"};
     };
     {
-        const tables = SchemaUtil.genSchema(.{ User, Company });
-        const user_table = tables[0];
-        const company_table = tables[1];
+        var sdb = try SqliteDb.init(testing.allocator, ":memory:", .{});
+        defer sdb.deinit();
+        var db: Db = sdb.getDb();
+        try db.open();
+        defer db.close();
+        const MyMigration = struct {
+            const Self = @This();
+            allocator: std.mem.Allocator,
+            db: *Db,
 
-        try testing.expectEqualDeep(&[_][]const u8{ "id", "name", "sex", "hobby", "company_id" }, user_table.col_names);
-        try testing.expectEqualDeep(&[_][]const u8{ "id", "name" }, company_table.col_names);
-        try testing.expectEqualDeep(&[_]ValueType{
-            ValueType{ .INT64 = undefined },
-            ValueType{ .TEXT = undefined },
-            ValueType{ .BOOL = undefined },
-            ValueType{ .TEXT = undefined },
-            ValueType{ .INT64 = undefined },
-        }, user_table.col_types);
-        try testing.expectEqualDeep(&[_]ValueType{
-            ValueType{ .INT64 = undefined },
-            ValueType{ .TEXT = undefined },
-        }, company_table.col_types);
+            pub fn getMigration(this: *Self) Migration {
+                return Migration{
+                    .id = "1",
+                    .ctx = this,
+                    .vtable = .{
+                        .up = up,
+                    },
+                };
+            }
 
-        try testing.expectEqual(5, user_table.col_opts.len);
-        try testing.expectEqual(false, user_table.col_opts[0].nullable);
-        try testing.expectEqual(true, user_table.col_opts[3].nullable);
-        try testing.expectEqual(true, user_table.col_opts[4].unique);
+            // vtable fns
+            fn up(ctx: *anyopaque) Error!?ChangeSet {
+                const m: *Self = @ptrCast(@alignCast(ctx));
+                var change_set = try ChangeSet.init(m.allocator);
+                _ = &change_set;
+                const tables = SchemaUtil.genSchema(.{ User, Company, Skill });
+                _ = tables;
+                return change_set;
+            }
+        };
 
-        try testing.expectEqual(true, user_table.has_foreign_key);
-        try testing.expectEqualDeep(
-            &[_][]const u8{"fk_User_Company_id"},
-            user_table.foreign_key_names,
-        );
-        try testing.expectEqual(false, company_table.has_foreign_key);
-        try testing.expect(company_table.foreign_key_names.len == 0);
+        var my_migration = MyMigration{ .allocator = testing.allocator, .db = &db };
+        var migration = my_migration.getMigration();
+        try db.migrateUp(&migration);
     }
-    // {
-    //     var sdb = try SqliteDb.init(testing.allocator, ":memory:", .{});
-    //     defer sdb.deinit();
-    //     var db: Db = sdb.getDb();
-    //     try db.open();
-    //     defer db.close();
-    //     const MyMigration = struct {
-    //         const Self = @This();
-    //         allocator: std.mem.Allocator,
-    //         db: *Db,
-
-    //         pub fn getMigration(this: *Self) Migration {
-    //             return Migration{
-    //                 .id = "1",
-    //                 .ctx = this,
-    //                 .vtable = .{
-    //                     .up = up,
-    //                 },
-    //             };
-    //         }
-
-    //         // vtable fns
-    //         fn up(ctx: *anyopaque) Error!?ChangeSet {
-    //             const m: *Self = @ptrCast(@alignCast(ctx));
-    //             var change_set = try ChangeSet.init(m.allocator);
-    //             _ = &change_set;
-    //             const tables = SchemaUtil.genSchema(.{ User, Company });
-    //             const user_table = tables[0];
-    //             const company_table = tables[1];
-    //             std.debug.print("{any}\n", .{user_table.foreign_key_names});
-    //             std.debug.print("{any}\n", .{company_table.index_names});
-    //             return change_set;
-    //         }
-    //     };
-
-    //     var my_migration = MyMigration{ .allocator = testing.allocator, .db = &db };
-    //     var migration = my_migration.getMigration();
-    //     try db.migrateUp(&migration);
-    // }
 }

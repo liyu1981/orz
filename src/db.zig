@@ -34,6 +34,15 @@ inline fn isStringLiteral(comptime T: type) bool {
     }
 }
 
+inline fn isArrayOf(comptime ChildType: type, comptime TestType: type) bool {
+    switch (@typeInfo(TestType)) {
+        .Array => |a| {
+            return a.child == ChildType;
+        },
+        else => return false,
+    }
+}
+
 // general errors for db related fns
 
 pub const Error = error{
@@ -75,6 +84,7 @@ pub const TableSchema = struct {
     table_name: []const u8 = undefined,
     col_names: [][]const u8 = undefined,
     col_types: []ValueType = undefined,
+    col_opts: []ColOpts = undefined,
     primary_key_names: [][]const u8 = undefined,
     has_foreign_key: bool = false,
     foreign_key_names: [][]const u8 = undefined,
@@ -85,6 +95,11 @@ pub const TableSchema = struct {
     index_names: [][]const u8 = undefined,
     index_keys: [][]const u8 = undefined,
     index_optss: []IndexOpts = undefined,
+};
+
+pub const ColOpts = struct {
+    nullable: bool = true,
+    unique: bool = false,
 };
 
 pub const RelationOpts = struct {
@@ -98,22 +113,14 @@ pub const IndexOpts = struct {};
 pub const SchemaUtil = struct {
     fn checkEntDef(comptime EntType: type) void {
         const ti = @typeInfo(EntType);
-        const vt = @typeInfo(ValueType).Union;
         switch (ti) {
             .Struct => |st| {
                 if (st.is_tuple) {
                     @compileError("EntType must be struct, found tuple:" ++ @typeName(EntType));
                 }
                 inline for (st.fields) |field| {
-                    comptime var found: bool = false;
-                    inline for (vt.fields) |vtfield| {
-                        if (vtfield.type == field.type) {
-                            found = true;
-                            break;
-                        }
-                    }
-                    if (!found) {
-                        @compileError("EntType field '" ++ field.name ++ "'' is not allowed in ValueType, found:" ++ @typeName(field.type));
+                    if (!(comptime ValueType.allow(field.type))) {
+                        @compileError(@typeName(EntType) ++ " field '" ++ field.name ++ "' with type '" ++ @typeName(field.type) ++ "' is not allowed in " ++ @typeName(ValueType));
                     }
                 }
             },
@@ -123,6 +130,7 @@ pub const SchemaUtil = struct {
         }
     }
 
+    /// will return the last segment of full name, e.g., sqlite3.Db.mytype => mytype.
     fn getLastTypeName(comptime EntType: type) []const u8 {
         const full_type_name = @typeName(EntType);
         var it = std.mem.splitBackwardsAny(u8, full_type_name, ".");
@@ -134,8 +142,13 @@ pub const SchemaUtil = struct {
     }
 
     fn assertValidRelationTuple(table_name: []const u8, i: usize, decl_relation: anytype) void {
-        comptime var buf: [1024]u8 = undefined;
+        comptime var buf: [256]u8 = undefined;
         const str_i = std.fmt.bufPrintIntToSlice(&buf, i, 10, .lower, .{});
+        if (decl_relation.len > 4) {
+            comptime var len_buf: [256]u8 = undefined;
+            const str_len = std.fmt.bufPrintIntToSlice(&len_buf, decl_relation.len, 10, .lower, .{});
+            @compileError(table_name ++ " entry " ++ str_i ++ " with number of items, expect tuple of 4 items, found " ++ str_len);
+        }
         if (!isStringLiteral(@TypeOf(decl_relation[0]))) {
             @compileError(table_name ++ " entry " ++ str_i ++ " with wrong type at item 0, expect string literal(*const [?:0]u8), found " ++ @typeName(@TypeOf(decl_relation[0])));
         }
@@ -147,6 +160,22 @@ pub const SchemaUtil = struct {
         }
         if (!isStruct(@TypeOf(decl_relation[3]))) {
             @compileError(table_name ++ " entry " ++ str_i ++ " with wrong type at item 3, expect Struct, found " ++ @typeName(decl_relation[3]));
+        }
+    }
+
+    fn assertValidIndexTuple(table_name: []const u8, i: usize, decl_index: anytype) void {
+        comptime var buf: [1024]u8 = undefined;
+        const str_i = std.fmt.bufPrintIntToSlice(&buf, i, 10, .lower, .{});
+        if (decl_index.len > 2) {
+            comptime var len_buf: [256]u8 = undefined;
+            const str_len = std.fmt.bufPrintIntToSlice(&len_buf, decl_index.len, 10, .lower, .{});
+            @compileError(table_name ++ " entry " ++ str_i ++ " with number of items, expect tuple of 2 items, found " ++ str_len);
+        }
+        if (!isArrayOf([]const u8, @TypeOf(decl_index[0]))) {
+            @compileError(table_name ++ " entry " ++ str_i ++ " with wrong type at item 0, expect [][]const u8, found " ++ @typeName(@TypeOf(decl_index[0])));
+        }
+        if (!isStruct(@TypeOf(decl_index[1]))) {
+            @compileError(table_name ++ " entry " ++ str_i ++ " with wrong type at item 1, expect Struct, found " ++ @typeName(decl_index[1]));
         }
     }
 
@@ -179,10 +208,10 @@ pub const SchemaUtil = struct {
     }
 
     fn calcIndexName(comptime table_name: []const u8, comptime i: usize, comptime decl_index: anytype) []const u8 {
-        _ = i;
         if (!isTuple(@TypeOf(decl_index))) {
             @compileError("each entry in indexes must be tuple, fund:" ++ @typeName(@TypeOf(decl_index)));
         }
+        assertValidIndexTuple(table_name, i, decl_index);
         comptime var final_name: []const u8 = "idx_" ++ table_name;
         inline for (0..decl_index[0].len) |j| {
             final_name = final_name ++ "_" ++ decl_index[0][j];
@@ -222,6 +251,13 @@ pub const SchemaUtil = struct {
         }
     }
 
+    fn calcColOpts(comptime T: type) ColOpts {
+        switch (@typeInfo(T)) {
+            .Optional => return ColOpts{ .nullable = true },
+            else => return ColOpts{ .nullable = false },
+        }
+    }
+
     pub fn calcTableSchema(comptime EntType: type) TableSchema {
         const ti_struct = @typeInfo(EntType).Struct;
         const fields = ti_struct.fields;
@@ -231,14 +267,17 @@ pub const SchemaUtil = struct {
 
         comptime var ent_col_names: [fields.len][]const u8 = undefined;
         comptime var ent_col_types: [fields.len]ValueType = undefined;
+        comptime var ent_col_opts: [fields.len]ColOpts = undefined;
         inline for (0..fields.len) |i| {
             ent_col_names[i] = fields[i].name;
             ent_col_types[i] = comptime ValueType.getUndefined(fields[i].type);
+            ent_col_opts[i] = comptime calcColOpts(fields[i].type);
         }
 
         comptime var with_decl_primary_key: bool = false;
         comptime var with_decl_relations: bool = false;
         comptime var with_decl_indexes: bool = false;
+        comptime var with_decl_unique_cols: bool = false;
         comptime {
             for (0..decls.len) |i| {
                 if (std.mem.eql(u8, decls[i].name, "relations")) {
@@ -249,6 +288,9 @@ pub const SchemaUtil = struct {
                 }
                 if (std.mem.eql(u8, decls[i].name, "indexes")) {
                     with_decl_indexes = true;
+                }
+                if (std.mem.eql(u8, decls[i].name, "unique_cols")) {
+                    with_decl_unique_cols = true;
                 }
             }
         }
@@ -303,10 +345,32 @@ pub const SchemaUtil = struct {
             }
         }
 
+        comptime {
+            if (with_decl_unique_cols) {
+                const decl_unique_cols = @field(EntType, "unique_cols");
+                for (decl_unique_cols) |unique_col_name| {
+                    var col_idx: usize = 0;
+                    var found_col_idx: bool = false;
+                    for (0..ent_col_names.len) |i| {
+                        if (std.mem.eql(u8, ent_col_names[i], unique_col_name)) {
+                            found_col_idx = true;
+                            col_idx = i;
+                            break;
+                        }
+                    }
+                    if (!found_col_idx) {
+                        @compileError("invalid unique col name: not find '" ++ unique_col_name ++ "' in " ++ @typeName(EntType));
+                    }
+                    ent_col_opts[col_idx].unique = true;
+                }
+            }
+        }
+
         return TableSchema{
             .table_name = table_name,
             .col_names = &ent_col_names,
             .col_types = &ent_col_types,
+            .col_opts = &ent_col_opts,
             .primary_key_names = &primary_key_names,
             .has_foreign_key = has_foreign_key,
             .foreign_key_names = &foreign_key_names,
@@ -320,18 +384,18 @@ pub const SchemaUtil = struct {
         };
     }
 
-    pub fn buildOne(comptime EntType: type) TableSchema {
+    pub fn genSchemaOne(comptime EntType: type) TableSchema {
         checkEntDef(EntType);
         return comptime calcTableSchema(EntType);
     }
 
-    pub fn build(comptime ent_type_tuple: anytype) [ent_type_tuple.len]TableSchema {
+    pub fn genSchema(comptime ent_type_tuple: anytype) [ent_type_tuple.len]TableSchema {
         if (!isTuple(@TypeOf(ent_type_tuple))) {
             @compileError("build only accepts a tuple of ent type struct, found:" ++ @typeName(@TypeOf(ent_type_tuple)));
         }
         var table_schemas: [ent_type_tuple.len]TableSchema = undefined;
         inline for (0..ent_type_tuple.len) |i| {
-            table_schemas[i] = SchemaUtil.buildOne(ent_type_tuple[i]);
+            table_schemas[i] = SchemaUtil.genSchemaOne(ent_type_tuple[i]);
         }
         return table_schemas;
     }
@@ -344,7 +408,7 @@ pub const Constraint = struct {};
 // query
 
 pub const ValueType = union(DataType) {
-    NULL: void,
+    NULL: void, // not used but has to make zig compiler happy
     BOOL: bool,
     INT8: i8,
     UINT8: u8,
@@ -359,22 +423,28 @@ pub const ValueType = union(DataType) {
     TEXT: []const u8,
     BLOB: []const i8,
 
+    pub fn allow(comptime T: type) bool {
+        switch (T) {
+            bool, ?bool, i8, ?i8, u8, ?u8, i16, ?i16, u16, ?u16, i32, ?i32, u32, ?u32, i64, ?i64, u64, ?u64, f32, ?f32, f64, ?f64, []const u8, ?[]const u8, []const i8, ?[]const i8 => return true,
+            else => return false,
+        }
+    }
+
     pub fn getUndefined(comptime T: type) ValueType {
         switch (T) {
-            void => return ValueType{ .NULL = undefined },
-            bool => return ValueType{ .BOOL = undefined },
-            i8 => return ValueType{ .INT8 = undefined },
-            u8 => return ValueType{ .UINT8 = undefined },
-            i16 => return ValueType{ .INT16 = undefined },
-            u16 => return ValueType{ .UINT16 = undefined },
-            i32 => return ValueType{ .INT32 = undefined },
-            u32 => return ValueType{ .UINT32 = undefined },
-            i64 => return ValueType{ .INT64 = undefined },
-            u64 => return ValueType{ .UINT64 = undefined },
-            f32 => return ValueType{ .FLOAT32 = undefined },
-            f64 => return ValueType{ .FLOAT64 = undefined },
-            []const u8 => return ValueType{ .TEXT = undefined },
-            []const i8 => return ValueType{ .BLOB = undefined },
+            bool, ?bool => return ValueType{ .BOOL = undefined },
+            i8, ?i8 => return ValueType{ .INT8 = undefined },
+            u8, ?u8 => return ValueType{ .UINT8 = undefined },
+            i16, ?i16 => return ValueType{ .INT16 = undefined },
+            u16, ?u16 => return ValueType{ .UINT16 = undefined },
+            i32, ?i32 => return ValueType{ .INT32 = undefined },
+            u32, ?u32 => return ValueType{ .UINT32 = undefined },
+            i64, ?i64 => return ValueType{ .INT64 = undefined },
+            u64, ?u64 => return ValueType{ .UINT64 = undefined },
+            f32, ?f32 => return ValueType{ .FLOAT32 = undefined },
+            f64, ?f64 => return ValueType{ .FLOAT64 = undefined },
+            []const u8, ?[]const u8 => return ValueType{ .TEXT = undefined },
+            []const i8, ?[]const i8 => return ValueType{ .BLOB = undefined },
             else => {
                 @compileError("Unsupported type: " ++ @typeName(T));
             },

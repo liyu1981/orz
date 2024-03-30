@@ -78,6 +78,7 @@ pub const SqliteDb = struct {
                 .implCreateTable = createTable,
                 .implDropTable = dropTable,
                 .implRenameTable = renameTable,
+                .implHasTable = hasTable,
                 .implAddColumn = addColumn,
                 .implDropColumn = dropColumn,
                 .implRenameColumn = renameColumn,
@@ -355,17 +356,17 @@ pub const SqliteDb = struct {
         };
         if (maybe_change_set) |*change_set| {
             defer change_set.deinit();
-            try db.queryExecuteSlice(s.allocator, "BEGIN TRANSACTION");
+            _ = try db.queryExecuteSlice(s.allocator, "BEGIN TRANSACTION");
             errdefer {
-                db.queryExecuteSlice(s.allocator, "ROLLBACK") catch |err| {
+                _ = db.queryExecuteSlice(s.allocator, "ROLLBACK") catch |err| {
                     std.debug.print("Rollback failed: {any}\n", .{err});
                 };
             }
             for (0..change_set.query_len) |i| {
-                try db.queryExecute(&change_set.query_buf[i]);
+                _ = try db.queryExecute(&change_set.query_buf[i]);
             }
             // TODO: need to update meta table
-            try db.queryExecuteSlice(s.allocator, "COMMIT");
+            _ = try db.queryExecuteSlice(s.allocator, "COMMIT");
         }
     }
 
@@ -417,6 +418,16 @@ pub const SqliteDb = struct {
             .db = db,
             .raw_query = try sql_buf.toOwnedSliceSentinel(0),
         });
+    }
+
+    fn hasTable(ctx: *anyopaque, db: *Db, table_name: []const u8) Error!bool {
+        const s: *SqliteDb = @ptrCast(@alignCast(ctx));
+        var sql_buf = std.ArrayList(u8).init(s.allocator);
+        defer sql_buf.deinit();
+        const sql_writer = sql_buf.writer();
+        try sql_writer.print("SELECT * FROM sqlite_master WHERE type='table' AND name='{s}'", .{table_name});
+        const row_affected = try db.queryExecuteSlice(s.allocator, sql_buf.items);
+        return row_affected > 0;
     }
 
     fn addColumn(ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, col_name: []const u8, col_type: ValueType, opts: DbVTable.AddColumnOpts) Error!void {
@@ -720,6 +731,18 @@ test "query" {
     }
 }
 
+test "migration_funcs" {
+    {
+        var sdb = try SqliteDb.init(testing.allocator, ":memory:", .{});
+        defer sdb.deinit();
+        var db: Db = sdb.getDb();
+        try db.open();
+        defer db.close();
+        try testing.expectEqual(0, try db.queryExecuteSlice(testing.allocator, "create table 'mytab' ('id' INTEGER);"));
+        try testing.expectEqual(true, try db.hasTable("mytab"));
+    }
+}
+
 test "simple_migration" {
     const User = struct {
         id: i64,
@@ -981,5 +1004,73 @@ test "complex_migration" {
         var my_migration = MyMigration{ .allocator = testing.allocator, .db = &db };
         var migration = my_migration.getMigration();
         try db.migrateUp(&migration);
+    }
+}
+
+test "validateTableSchemas" {
+    const Company = struct {
+        id: i64,
+        name: []const u8,
+        pub const indexes = .{
+            .{ [_][]const u8{"name"}, IndexOpts{} },
+        };
+    };
+    const Skill = struct {
+        id: i64,
+        name: []const u8,
+    };
+    const User = struct {
+        id: i64,
+        name: []const u8,
+        sex: bool,
+        hobby: ?[]const u8,
+        company_id: i64,
+        skill_id: i64,
+
+        // has to be pub as if not zig may not compile it
+        pub const primary_key = [_][]const u8{"id"};
+        pub const relations = .{
+            .{ "company_id", Company, "id", RelationOpts{ .cardinality = .one_to_one } },
+            .{ "skill_id", Skill, "id", RelationOpts{ .cardinality = .many_to_many } },
+        };
+        pub const unique_cols = [_][]const u8{"company_id"};
+    };
+    const TestUtil = struct {
+        var buf = std.ArrayList([]const u8).init(testing.allocator);
+
+        pub fn strMapKeys(m: anytype) []const []const u8 {
+            buf.clearRetainingCapacity();
+            var it = m.keyIterator();
+            while (it.next()) |kptr| {
+                buf.append(kptr.*) catch unreachable;
+            }
+            return buf.items;
+        }
+    };
+    defer TestUtil.buf.deinit();
+    {
+        var sdb = try SqliteDb.init(testing.allocator, ":memory:", .{});
+        defer sdb.deinit();
+        var db: Db = sdb.getDb();
+        try db.open();
+        defer db.close();
+        const table_schemas = SchemaUtil.genSchema(.{ User, Company, Skill });
+        var table_availability = try db.validateTableSchemas(testing.allocator, table_schemas);
+        defer {
+            table_availability.deinit();
+        }
+        try testing.expectEqual(4, table_availability.map.count());
+
+        const user_entry = if (table_availability.map.get("User")) |u| u else unreachable;
+        try testing.expectEqualDeep(&[_][]const u8{"Company"}, TestUtil.strMapKeys(user_entry.to_create.dependency_map));
+
+        const company_entry = if (table_availability.map.get("Company")) |c| c else unreachable;
+        try testing.expectEqualDeep(&[_][]const u8{}, TestUtil.strMapKeys(company_entry.to_create.dependency_map));
+
+        const skill_entry = if (table_availability.map.get("Skill")) |c| c else unreachable;
+        try testing.expectEqualDeep(&[_][]const u8{}, TestUtil.strMapKeys(skill_entry.to_create.dependency_map));
+
+        const m2m_entry = if (table_availability.map.get("m2m_Skill_id_User_skill_id")) |m| m else unreachable;
+        try testing.expectEqualDeep(&[_][]const u8{ "User", "Skill" }, TestUtil.strMapKeys(m2m_entry.to_create.dependency_map));
     }
 }

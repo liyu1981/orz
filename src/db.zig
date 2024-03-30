@@ -58,6 +58,8 @@ pub const Error = error{
     StmtBindTooBig,
     StmtBindNomem,
     StmtBindRange,
+} || error{
+    NoSpaceLeft,
 } || std.mem.Allocator.Error;
 
 // data type
@@ -1080,6 +1082,7 @@ pub const DbVTable = struct {
     implCreateTable: *const fn (ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, col_names: [][]const u8, col_types: []ValueType, opts: CreateTableOpts) Error!void,
     implDropTable: *const fn (ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, opts: DropTableOpts) Error!void,
     implRenameTable: *const fn (ctx: *anyopaque, db: *Db, chagne_set: *ChangeSet, from_table_name: []const u8, to_table_name: []const u8, opts: RenameTableOpts) Error!void,
+    implHasTable: *const fn (ctx: *anyopaque, db: *Db, table_name: []const u8) Error!bool,
     implAddColumn: *const fn (ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, col_name: []const u8, col_type: ValueType, opts: AddColumnOpts) Error!void,
     implDropColumn: *const fn (ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, col_name: []const u8, opts: DropColumnOpts) Error!void,
     implRenameColumn: *const fn (ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, from_col_name: []const u8, to_col_name: []const u8, opts: RenameColumnOpts) Error!void,
@@ -1140,23 +1143,122 @@ pub inline fn migrateDown(this: *Db, migration: *Migration) Error!void {
 
 // wrappers
 
-pub fn queryExecute(this: *Db, query: *Query) Error!void {
+pub fn queryExecute(this: *Db, query: *Query) Error!usize {
     try this.queryEvaluate(query);
     var rit = try query.iterator();
-    _ = try rit.next();
+    while (true) {
+        if ((try rit.next()) != null) continue else break;
+    }
     query.finalize();
+    return query.row_affected;
 }
 
-pub fn queryExecuteSlice(this: *Db, allocator: std.mem.Allocator, query: []const u8) Error!void {
+pub fn queryExecuteSlice(this: *Db, allocator: std.mem.Allocator, query: []const u8) Error!usize {
     var q = try Query.init(allocator, this, query, null);
     try this.queryEvaluate(&q);
     var rit = try q.iterator();
-    _ = try rit.next();
+    while (true) {
+        if ((try rit.next()) != null) continue else break;
+    }
     q.finalize();
+    const row_affected = q.row_affected;
     q.deinit();
+    return row_affected;
 }
 
 // migration fns
+
+pub const TableAvailablity = union(enum) {
+    to_create: struct {
+        dependency_map: std.StringHashMap(void),
+    },
+    existed: void,
+};
+
+pub const TableAvailablityMap = struct {
+    arena: std.heap.ArenaAllocator,
+    map: std.StringArrayHashMap(TableAvailablity),
+
+    pub fn deinit(this: *TableAvailablityMap) void {
+        this.arena.deinit();
+    }
+};
+
+/// returned string hashmap of TableAvailablity must be freed by user
+pub fn validateTableSchemas(this: *Db, allocator: std.mem.Allocator, table_schemas: []TableSchema) !TableAvailablityMap {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    var known_tables = std.StringArrayHashMap(TableAvailablity).init(arena.allocator());
+
+    for (table_schemas) |table_schema| {
+        try known_tables.put(
+            table_schema.table_name,
+            TableAvailablity{
+                .to_create = .{
+                    .dependency_map = std.StringHashMap(void).init(arena.allocator()),
+                },
+            },
+        );
+    }
+
+    var buf: [8192]u8 = undefined;
+    for (table_schemas) |table_schema| {
+        if (try this.hasTable(table_schema.table_name)) {
+            const msg = try std.fmt.bufPrint(&buf, "table '{s}' alreay exists!", .{table_schema.table_name});
+            @panic(msg);
+        }
+
+        if (!table_schema.has_foreign_key) {
+            continue;
+        }
+
+        var known_entry = if (known_tables.getPtr(table_schema.table_name)) |e| e else {
+            @panic("impossilbe this table disappeared!");
+        };
+
+        for (table_schema.foreign_keys) |fk| {
+            if (!known_tables.contains(fk.table_name)) {
+                if (try this.hasTable(fk.table_name)) {
+                    try known_tables.put(fk.table_name, TableAvailablity{ .existed = {} });
+                } else {
+                    const msg = try std.fmt.bufPrint(&buf, "table '{s}' referenced table '{s}' in foreign key '{s}', which is neither existing in current db, nor will be created.", .{ table_schema.table_name, fk.table_name, fk.name });
+                    @panic(msg);
+                }
+            }
+            switch (known_entry.*) {
+                .to_create => {
+                    try known_entry.to_create.dependency_map.put(fk.table_name, {});
+                },
+                .existed => unreachable,
+            }
+        }
+    }
+
+    return .{
+        .arena = arena,
+        .map = known_tables,
+    };
+}
+
+pub fn freeTableAvailability(table_availability: *TableAvailablityMap) void {
+    var it = table_availability.iterator();
+    while (it.next()) |e| {
+        switch (e.value_ptr.*) {
+            .to_create => |*e2| {
+                e2.dependency_map.deinit();
+            },
+            .existed => {},
+        }
+    }
+    table_availability.deinit();
+}
+
+pub fn createTables(this: *Db, table_schemas: []TableSchema) Error!void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+
+    const table_avalibility = try this.validateTableSchemas(arena.allocator(), table_schemas);
+    _ = table_avalibility;
+}
 
 pub inline fn createTable(this: *Db, change_set: *ChangeSet, ent: TableSchema, opts: DbVTable.CreateTableOpts) Error!void {
     try this.vtable.implCreateTable(this.ctx, this, change_set, ent.table_name, ent.col_names, ent.col_types, opts);
@@ -1168,6 +1270,10 @@ pub inline fn dropTable(this: *Db, change_set: *ChangeSet, ent: TableSchema, opt
 
 pub inline fn renameTable(this: *Db, change_set: *ChangeSet, from_table_name: []const u8, to_table_name: []const u8, opts: DbVTable.RenameTableOpts) Error!void {
     try this.vtable.implRenameTable(this.ctx, this, change_set, from_table_name, to_table_name, opts);
+}
+
+pub inline fn hasTable(this: *Db, table_name: []const u8) Error!bool {
+    return try this.vtable.implHasTable(this.ctx, this, table_name);
 }
 
 pub inline fn addColumn(this: *Db, change_set: *ChangeSet, table_name: []const u8, col_name: []const u8, col_type: ValueType, opts: DbVTable.AddColumnOpts) Error!void {

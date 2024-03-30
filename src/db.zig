@@ -82,32 +82,45 @@ pub const DataType = enum {
 // schema & create
 
 pub const TableSchema = struct {
+    pub const Column = struct {
+        name: []const u8 = undefined,
+        type: ValueType = undefined,
+        opts: ColOpts = undefined,
+    };
+    pub const ForeignKey = struct {
+        name: []const u8 = undefined,
+        col_name: []const u8 = undefined,
+        table_name: []const u8 = undefined,
+        table_col_name: []const u8 = undefined,
+        opts: RelationOpts = undefined,
+    };
+    pub const Index = struct {
+        name: []const u8 = undefined,
+        keys: []const u8 = undefined,
+        opts: IndexOpts = undefined,
+    };
+    pub const Dependency = struct {
+        table_name: []const u8 = undefined,
+        satisfied: bool = false,
+    };
+
     table_name: []const u8 = undefined,
-    col_names: [][]const u8 = undefined,
-    col_types: []ValueType = undefined,
-    col_opts: []ColOpts = undefined,
-    primary_key_names: [][]const u8 = undefined,
+    columns: []Column = undefined,
+    primary_key_names: []const []const u8 = undefined,
     has_foreign_key: bool = false,
-    foreign_key_names: [][]const u8 = undefined,
-    foreign_key_col_names: [][]const u8 = undefined,
-    foreign_key_target_table_names: [][]const u8 = undefined,
-    foreign_key_target_col_names: [][]const u8 = undefined,
-    foreign_key_relation_optss: []RelationOpts = undefined,
+    foreign_keys: []ForeignKey = undefined,
     has_indexes: bool = false,
-    index_names: [][]const u8 = undefined,
-    index_keys: [][]const u8 = undefined,
-    index_optss: []IndexOpts = undefined,
-    relation_checked: bool = false,
-    denpendency_list: [][]const u8 = undefined,
+    indexes: []Index = undefined,
+    dependencies: []Dependency = undefined,
 };
 
 pub const ColOpts = struct {
-    nullable: bool = true,
+    nullable: bool = false,
     unique: bool = false,
 };
 
 pub const RelationOpts = struct {
-    cardinality: enum { one_to_one, many_to_one, many_to_many } = .one_to_one,
+    cardinality: enum { one_to_one, many_to_one, many_to_many } = .many_to_one,
     delete_action: enum { cascade, restrict, no_action, set_null, set_default } = .cascade,
     update_action: enum { cascade, restrict, no_action, set_null, set_default } = .cascade,
 };
@@ -216,30 +229,49 @@ pub const SchemaUtil = struct {
         }
     }
 
-    fn calcForeignKeyName(comptime table_name: []const u8, comptime i: usize, comptime decl_relation: anytype) []const u8 {
+    fn calcForeignKeyName(
+        comptime table_name: []const u8,
+        comptime i: usize,
+        comptime column_entry: TableSchema.Column,
+        comptime decl_relation: anytype,
+    ) []const u8 {
         comptime {
             if (!isTuple(@TypeOf(decl_relation))) {
                 @compileError("each entry in relations must be tuple, fund:" ++ @typeName(@TypeOf(decl_relation)));
             }
+
             assertValidRelationTuple(table_name, i, decl_relation);
+
             const target_table_name = getLastTypeName(decl_relation[1]);
+
+            switch (decl_relation[3].cardinality) {
+                .one_to_one => {
+                    if (!column_entry.opts.unique) {
+                        @compileError("table '" ++ table_name ++ "' col '" ++ decl_relation[2] ++ "' must be unique if relation to table '" ++ target_table_name ++ "' marked as .one_to_one!");
+                    }
+                },
+                .many_to_one => {
+                    if (column_entry.opts.unique) {
+                        @compileError("table '" ++ table_name ++ "' col '" ++ decl_relation[2] ++ "' is unique while relation to table '" ++ target_table_name ++ "' marked as .many_to_one!");
+                    }
+                },
+                .many_to_many => unreachable,
+            }
+
             return "fk_" ++ table_name ++ "_" ++ target_table_name ++ "_" ++ decl_relation[2] ++ "_" ++
                 switch (decl_relation[3].cardinality) {
                 .one_to_one => "o2o",
                 .many_to_one => "m2o",
-                .many_to_many => "m2m",
+                .many_to_many => unreachable,
             };
         }
     }
 
     fn calcForeignKeyArrays(
         comptime table_name: []const u8,
+        comptime columns: []TableSchema.Column,
         comptime decl_relations: anytype,
-        comptime fk_names: [][]const u8,
-        comptime fk_col_names: [][]const u8,
-        comptime fk_target_table_names: [][]const u8,
-        comptime fk_target_col_names: [][]const u8,
-        comptime fk_relation_optss: []RelationOpts,
+        comptime fks: []TableSchema.ForeignKey,
     ) usize {
         comptime {
             if (!isTuple(@TypeOf(decl_relations))) {
@@ -250,11 +282,16 @@ pub const SchemaUtil = struct {
                 const decl_relation = decl_relations[i];
                 switch (decl_relation[3].cardinality) {
                     .one_to_one, .many_to_one => {
-                        fk_names[i] = calcForeignKeyName(table_name, i, decl_relations[i]);
-                        fk_col_names[i] = decl_relations[i][0];
-                        fk_target_table_names[i] = getLastTypeName(decl_relations[i][1]);
-                        fk_target_col_names[i] = decl_relations[i][2];
-                        fk_relation_optss[i] = decl_relations[i][3];
+                        fks[i].name = calcForeignKeyName(
+                            table_name,
+                            i,
+                            columns[i],
+                            decl_relations[i],
+                        );
+                        fks[i].col_name = decl_relations[i][0];
+                        fks[i].table_name = getLastTypeName(decl_relations[i][1]);
+                        fks[i].table_col_name = decl_relations[i][2];
+                        fks[i].opts = decl_relations[i][3];
                         fk_count += 1;
                     },
                     .many_to_many => {},
@@ -278,6 +315,7 @@ pub const SchemaUtil = struct {
         }
     }
 
+    /// will return a comma joined key array, like id,name
     fn calcIndexKey(comptime decl_index: anytype) []const u8 {
         comptime {
             if (!isTuple(@TypeOf(decl_index))) {
@@ -298,18 +336,16 @@ pub const SchemaUtil = struct {
     fn calcIndexArrays(
         comptime table_name: []const u8,
         comptime decl_indexes: anytype,
-        comptime index_names: [][]const u8,
-        comptime index_keys: [][]const u8,
-        comptime index_optss: []IndexOpts,
+        comptime indexes: []TableSchema.Index,
     ) void {
         comptime {
             if (!isTuple(@TypeOf(decl_indexes))) {
                 @compileError("indexes must be tuple, fund:" ++ @typeName(@TypeOf(decl_indexes)));
             }
             for (0..decl_indexes.len) |i| {
-                index_names[i] = calcIndexName(table_name, i, decl_indexes[i]);
-                index_keys[i] = calcIndexKey(decl_indexes[i]);
-                index_optss[i] = decl_indexes[i][1];
+                indexes[i].name = calcIndexName(table_name, i, decl_indexes[i]);
+                indexes[i].keys = calcIndexKey(decl_indexes[i]);
+                indexes[i].opts = decl_indexes[i][1];
             }
         }
     }
@@ -322,26 +358,15 @@ pub const SchemaUtil = struct {
     }
 
     pub fn calcTableSchema(comptime EntType: type) TableSchema {
-        const ti_struct = @typeInfo(EntType).Struct;
-        const fields = ti_struct.fields;
-        const decls = ti_struct.decls;
-
-        const table_name = getLastTypeName(EntType);
-
-        comptime var ent_col_names: [fields.len][]const u8 = undefined;
-        comptime var ent_col_types: [fields.len]ValueType = undefined;
-        comptime var ent_col_opts: [fields.len]ColOpts = undefined;
-        inline for (0..fields.len) |i| {
-            ent_col_names[i] = fields[i].name;
-            ent_col_types[i] = comptime ValueType.getUndefined(fields[i].type);
-            ent_col_opts[i] = comptime calcColOpts(fields[i].type);
-        }
-
-        comptime var with_decl_primary_key: bool = false;
-        comptime var with_decl_relations: bool = false;
-        comptime var with_decl_indexes: bool = false;
-        comptime var with_decl_unique_cols: bool = false;
         comptime {
+            const ti_struct = @typeInfo(EntType).Struct;
+            const fields = ti_struct.fields;
+            const decls = ti_struct.decls;
+
+            var with_decl_primary_key: bool = false;
+            var with_decl_relations: bool = false;
+            var with_decl_indexes: bool = false;
+            var with_decl_unique_cols: bool = false;
             for (0..decls.len) |i| {
                 if (std.mem.eql(u8, decls[i].name, "relations")) {
                     with_decl_relations = true;
@@ -356,69 +381,24 @@ pub const SchemaUtil = struct {
                     with_decl_unique_cols = true;
                 }
             }
-        }
 
-        comptime var primary_key_names: [if (with_decl_primary_key) @field(EntType, "primary_key").len else 1][]const u8 = undefined;
-        comptime {
-            if (with_decl_primary_key) {
-                const decl_primary_key = @field(EntType, "primary_key");
-                for (0..decl_primary_key.len) |i| {
-                    primary_key_names[i] = decl_primary_key[i];
-                }
-            } else {
-                // first col will be used as primary key
-                if (ent_col_names.len == 0) {
-                    @compileError(@typeName(EntType) ++ " has no field can be used as primary key!");
-                }
-                primary_key_names[0] = ent_col_names[0];
+            const table_name = getLastTypeName(EntType);
+
+            var ent_cols: [fields.len]TableSchema.Column = undefined;
+            for (0..fields.len) |i| {
+                ent_cols[i].name = fields[i].name;
+                ent_cols[i].type = ValueType.getUndefined(fields[i].type);
+                ent_cols[i].opts = calcColOpts(fields[i].type);
             }
-        }
 
-        const has_foreign_key: bool = if (with_decl_relations) @field(EntType, "relations").len > 0 else false;
-        const foreign_key_capacity = if (with_decl_relations) @field(EntType, "relations").len else 0;
-        comptime var foreign_key_names: [foreign_key_capacity][]const u8 = undefined;
-        comptime var foreign_key_col_names: [foreign_key_capacity][]const u8 = undefined;
-        comptime var foreign_key_target_table_names: [foreign_key_capacity][]const u8 = undefined;
-        comptime var foreign_key_target_col_names: [foreign_key_capacity][]const u8 = undefined;
-        comptime var foreign_key_relation_optss: [foreign_key_capacity]RelationOpts = undefined;
-        const foreign_key_count = if (has_foreign_key)
-            calcForeignKeyArrays(
-                table_name,
-                @field(EntType, "relations"),
-                &foreign_key_names,
-                &foreign_key_col_names,
-                &foreign_key_target_table_names,
-                &foreign_key_target_col_names,
-                &foreign_key_relation_optss,
-            )
-        else
-            @as(usize, 0);
-
-        const has_indexes = if (with_decl_indexes) @field(EntType, "indexes").len > 0 else false;
-        const index_capacity = if (with_decl_indexes) @field(EntType, "indexes").len else 0;
-        comptime var index_names: [index_capacity][]const u8 = undefined;
-        comptime var index_keys: [index_capacity][]const u8 = undefined;
-        comptime var index_optss: [index_capacity]IndexOpts = undefined;
-        comptime {
-            if (has_indexes) {
-                calcIndexArrays(
-                    table_name,
-                    @field(EntType, "indexes"),
-                    &index_names,
-                    &index_keys,
-                    &index_optss,
-                );
-            }
-        }
-
-        comptime {
+            // unique cols need to be before others, especially foreign_keys
             if (with_decl_unique_cols) {
                 const decl_unique_cols = @field(EntType, "unique_cols");
                 for (decl_unique_cols) |unique_col_name| {
                     var col_idx: usize = 0;
                     var found_col_idx: bool = false;
-                    for (0..ent_col_names.len) |i| {
-                        if (std.mem.eql(u8, ent_col_names[i], unique_col_name)) {
+                    for (0..ent_cols.len) |i| {
+                        if (std.mem.eql(u8, ent_cols[i].name, unique_col_name)) {
                             found_col_idx = true;
                             col_idx = i;
                             break;
@@ -427,47 +407,89 @@ pub const SchemaUtil = struct {
                     if (!found_col_idx) {
                         @compileError("invalid unique col name: not find '" ++ unique_col_name ++ "' in " ++ @typeName(EntType));
                     }
-                    ent_col_opts[col_idx].unique = true;
+                    ent_cols[col_idx].opts.unique = true;
                 }
             }
-        }
 
-        return TableSchema{
-            .table_name = table_name,
-            .col_names = &ent_col_names,
-            .col_types = &ent_col_types,
-            .col_opts = &ent_col_opts,
-            .primary_key_names = &primary_key_names,
-            .has_foreign_key = has_foreign_key,
-            .foreign_key_names = foreign_key_names[0..foreign_key_count],
-            .foreign_key_col_names = foreign_key_col_names[0..foreign_key_count],
-            .foreign_key_target_table_names = foreign_key_target_table_names[0..foreign_key_count],
-            .foreign_key_target_col_names = foreign_key_target_col_names[0..foreign_key_count],
-            .foreign_key_relation_optss = foreign_key_relation_optss[0..foreign_key_count],
-            .has_indexes = has_indexes,
-            .index_names = &index_names,
-            .index_keys = &index_keys,
-            .index_optss = &index_optss,
-        };
+            var primary_key_names: [if (with_decl_primary_key) @field(EntType, "primary_key").len else 1][]const u8 = undefined;
+            if (with_decl_primary_key) {
+                const decl_primary_key = @field(EntType, "primary_key");
+                for (0..decl_primary_key.len) |i| {
+                    primary_key_names[i] = decl_primary_key[i];
+                }
+                if (decl_primary_key.len == 1) {
+                    const pname_idx = brk: {
+                        const pname = primary_key_names[0];
+                        for (0..ent_cols.len) |i| {
+                            if (std.mem.eql(u8, ent_cols[i].name, pname)) {
+                                break :brk i;
+                            }
+                        }
+                        unreachable;
+                    };
+                    ent_cols[pname_idx].opts.unique = true;
+                }
+            } else {
+                // first col will be used as primary key
+                if (ent_cols.len == 0) {
+                    @compileError(@typeName(EntType) ++ " has no field can be used as primary key!");
+                }
+                primary_key_names[0] = ent_cols[0].name;
+                ent_cols[0].opts.unique = true;
+            }
+
+            const has_foreign_key: bool = if (with_decl_relations) @field(EntType, "relations").len > 0 else false;
+            const foreign_key_capacity = if (with_decl_relations) @field(EntType, "relations").len else 0;
+            var foreign_keys: [foreign_key_capacity]TableSchema.ForeignKey = undefined;
+            const foreign_key_count = if (has_foreign_key)
+                calcForeignKeyArrays(
+                    table_name,
+                    &ent_cols,
+                    @field(EntType, "relations"),
+                    &foreign_keys,
+                )
+            else
+                @as(usize, 0);
+
+            const has_indexes = if (with_decl_indexes) @field(EntType, "indexes").len > 0 else false;
+            const index_capacity = if (with_decl_indexes) @field(EntType, "indexes").len else 0;
+            var indexes: [index_capacity]TableSchema.Index = undefined;
+            if (has_indexes) {
+                calcIndexArrays(
+                    table_name,
+                    @field(EntType, "indexes"),
+                    &indexes,
+                );
+            }
+
+            return TableSchema{
+                .table_name = table_name,
+                .columns = &ent_cols,
+                .primary_key_names = &primary_key_names,
+                .has_foreign_key = has_foreign_key,
+                .foreign_keys = foreign_keys[0..foreign_key_count],
+                .has_indexes = has_indexes,
+                .indexes = &indexes,
+            };
+        }
     }
 
     /// check for base table whether they have valid decl of many2many relation etc. After checking, the checked flag will set to true.
     // TODO: what if there is already existing tables?
     pub fn checkRelation(comptime target: *TableSchema, comptime all_tables: []TableSchema) void {
-        for (target.foreign_key_target_table_names) |target_table_name| {
+        for (target.foreign_keys) |fk| {
             const found: bool = brk: {
                 for (all_tables) |table| {
-                    if (std.mem.eql(u8, target_table_name, table.table_name)) {
+                    if (std.mem.eql(u8, fk.table_name, table.table_name)) {
                         break :brk true;
                     }
                 }
                 break :brk false;
             };
             if (!found) {
-                @compileError("'" ++ target.table_name ++ "'' specified a relation to not existing table '" ++ target_table_name ++ "'");
+                @compileError("'" ++ target.table_name ++ "'' specified a relation to not existing table '" ++ fk.table_name ++ "'");
             }
         }
-        target.relation_checked = true;
     }
 
     inline fn calcM2MTableName(
@@ -489,72 +511,77 @@ pub const SchemaUtil = struct {
         comptime table2: *TableSchema,
         comptime table2_col_name: []const u8,
     ) TableSchema {
-        const table1_col_type = brk: {
-            for (0..table1.col_names.len) |i| {
-                if (std.mem.eql(u8, table1_col_name, table1.col_names[i])) {
-                    break :brk table1.col_types[i];
+        comptime {
+            const table1_col_type = brk: {
+                for (0..table1.columns.len) |i| {
+                    if (std.mem.eql(u8, table1_col_name, table1.columns[i].name)) {
+                        break :brk table1.columns[i].type;
+                    }
                 }
-            }
-            unreachable;
-        };
-        const table2_col_type = brk: {
-            for (0..table2.col_names.len) |i| {
-                if (std.mem.eql(u8, table2_col_name, table2.col_names[i])) {
-                    break :brk table2.col_types[i];
+                unreachable;
+            };
+            const table2_col_type = brk: {
+                for (0..table2.columns.len) |i| {
+                    if (std.mem.eql(u8, table2_col_name, table2.columns[i].name)) {
+                        break :brk table2.columns[i].type;
+                    }
                 }
-            }
-            unreachable;
-        };
+                unreachable;
+            };
 
-        const col1_name = table1.table_name ++ "_" ++ table1_col_name;
-        const col2_name = table2.table_name ++ "_" ++ table2_col_name;
+            const col1_name = table1.table_name ++ "_" ++ table1_col_name;
+            const col2_name = table2.table_name ++ "_" ++ table2_col_name;
 
-        comptime var ent_col_names: [3][]const u8 = undefined;
-        comptime var ent_col_types: [3]ValueType = undefined;
-        comptime var ent_col_opts: [3]ColOpts = undefined;
-        ent_col_names[0] = "id";
-        ent_col_types[0] = ValueType.getUndefined(i64);
-        ent_col_opts[0] = ColOpts{};
-        ent_col_names[1] = col1_name;
-        ent_col_types[1] = table1_col_type;
-        ent_col_opts[1] = ColOpts{};
-        ent_col_names[2] = col2_name;
-        ent_col_types[2] = table2_col_type;
-        ent_col_opts[2] = ColOpts{};
+            var ent_cols = [_]TableSchema.Column{
+                TableSchema.Column{
+                    .name = "id",
+                    .type = ValueType.getUndefined(i64),
+                    .opts = ColOpts{},
+                },
+                TableSchema.Column{
+                    .name = col1_name,
+                    .type = table1_col_type,
+                    .opts = ColOpts{},
+                },
+                TableSchema.Column{
+                    .name = col2_name,
+                    .type = table2_col_type,
+                    .opts = ColOpts{},
+                },
+            };
+            _ = &ent_cols;
 
-        comptime var foreign_key_names: [2][]const u8 = undefined;
-        comptime var foreign_key_col_names: [2][]const u8 = undefined;
-        comptime var foreign_key_target_table_names: [2][]const u8 = undefined;
-        comptime var foreign_key_target_col_names: [2][]const u8 = undefined;
-        comptime var foreign_key_relation_optss: [2]RelationOpts = undefined;
-        foreign_key_names[0] = "fk_" ++ table_name ++ "_0";
-        foreign_key_col_names[0] = col1_name;
-        foreign_key_target_table_names[0] = table1.table_name;
-        foreign_key_target_col_names[0] = table1_col_name;
-        foreign_key_relation_optss[0] = RelationOpts{ .cardinality = .many_to_one };
-        foreign_key_names[1] = "fk_" ++ table_name ++ "_1";
-        foreign_key_col_names[1] = col2_name;
-        foreign_key_target_table_names[1] = table2.table_name;
-        foreign_key_target_col_names[1] = table2_col_name;
-        foreign_key_relation_optss[1] = RelationOpts{ .cardinality = .many_to_one };
+            var foreign_keys = [_]TableSchema.ForeignKey{
+                TableSchema.ForeignKey{
+                    .name = "fk_" ++ table_name ++ "_0",
+                    .col_name = col1_name,
+                    .table_name = table1.table_name,
+                    .table_col_name = table1_col_name,
+                    .opts = RelationOpts{ .cardinality = .many_to_one },
+                },
+                TableSchema.ForeignKey{
+                    .name = "fk_" ++ table_name ++ "_1",
+                    .col_name = col2_name,
+                    .table_name = table2.table_name,
+                    .table_col_name = table2_col_name,
+                    .opts = RelationOpts{ .cardinality = .many_to_one },
+                },
+            };
+            _ = &foreign_keys;
 
-        var primary_key_names = [_][]const u8{"id"};
+            var primary_key_names = [_][]const u8{"id"};
+            _ = &primary_key_names;
+            ent_cols[0].opts.unique = true;
 
-        return TableSchema{
-            .table_name = table_name,
-            .col_names = &ent_col_names,
-            .col_types = &ent_col_types,
-            .col_opts = &ent_col_opts,
-            .primary_key_names = &primary_key_names,
-            .has_foreign_key = true,
-            .foreign_key_names = &foreign_key_names,
-            .foreign_key_col_names = &foreign_key_col_names,
-            .foreign_key_target_table_names = &foreign_key_target_table_names,
-            .foreign_key_target_col_names = &foreign_key_target_col_names,
-            .foreign_key_relation_optss = &foreign_key_relation_optss,
-            .has_indexes = false,
-            .relation_checked = true,
-        };
+            return TableSchema{
+                .table_name = table_name,
+                .columns = &ent_cols,
+                .primary_key_names = &primary_key_names,
+                .has_foreign_key = true,
+                .foreign_keys = &foreign_keys,
+                .has_indexes = false,
+            };
+        }
     }
 
     pub fn calcM2MTableSchema(
@@ -641,37 +668,37 @@ pub const SchemaUtil = struct {
 
     /// genSchemaOne will not do relation checking, which needs to be manually checked later
     pub fn genSchemaOne(comptime EntType: type) TableSchema {
-        checkEntDef(EntType);
-        if (countEntTypeManyToManyRelation(EntType) > 0) {
-            @compileError(@typeName(EntType) ++ " defined many_to_many relation, can not genSchemaOne, please use genSchema");
-        }
-        return comptime calcTableSchema(EntType);
+        const final_table_schema = comptime brk: {
+            checkEntDef(EntType);
+            break :brk calcTableSchema(EntType);
+        };
+        return final_table_schema;
     }
 
     /// genSchema will auto do relation checking
     pub fn genSchema(comptime ent_type_tuple: anytype) []TableSchema {
-        if (!isTuple(@TypeOf(ent_type_tuple))) {
-            @compileError("build only accepts a tuple of ent type struct, found:" ++ @typeName(@TypeOf(ent_type_tuple)));
-        }
+        const final_table_schemas = comptime brk: {
+            if (!isTuple(@TypeOf(ent_type_tuple))) {
+                @compileError("build only accepts a tuple of ent type struct, found:" ++ @typeName(@TypeOf(ent_type_tuple)));
+            }
 
-        inline for (0..ent_type_tuple.len) |i| {
-            checkEntDef(ent_type_tuple[i]);
-        }
+            for (0..ent_type_tuple.len) |i| {
+                checkEntDef(ent_type_tuple[i]);
+            }
 
-        comptime var possible_m2m_table_count: usize = 0;
-        inline for (0..ent_type_tuple.len) |i| {
-            possible_m2m_table_count += countEntTypeManyToManyRelation(ent_type_tuple[i]);
-        }
+            var possible_m2m_table_count: usize = 0;
+            for (0..ent_type_tuple.len) |i| {
+                possible_m2m_table_count += countEntTypeManyToManyRelation(ent_type_tuple[i]);
+            }
 
-        comptime var table_schemas: [ent_type_tuple.len + possible_m2m_table_count]TableSchema = undefined;
-        comptime var table_schema_gen_count: usize = 0;
-        inline for (0..ent_type_tuple.len) |i| {
-            table_schemas[i] = comptime calcTableSchema(ent_type_tuple[i]);
-            table_schema_gen_count += 1;
-        }
+            var table_schemas: [ent_type_tuple.len + possible_m2m_table_count]TableSchema = undefined;
+            var table_schema_gen_count: usize = 0;
+            for (0..ent_type_tuple.len) |i| {
+                table_schemas[i] = calcTableSchema(ent_type_tuple[i]);
+                table_schema_gen_count += 1;
+            }
 
-        const based_table_schema_count = table_schema_gen_count;
-        comptime {
+            const based_table_schema_count = table_schema_gen_count;
             for (0..based_table_schema_count) |i| {
                 const ent_type = ent_type_tuple[i];
                 table_schema_gen_count += calcM2MTableSchema(
@@ -682,15 +709,14 @@ pub const SchemaUtil = struct {
                     table_schema_gen_count,
                 );
             }
-        }
 
-        comptime {
             for (0..based_table_schema_count) |i| {
                 SchemaUtil.checkRelation(&table_schemas[i], &table_schemas);
             }
-        }
 
-        return table_schemas[0..table_schema_gen_count];
+            break :brk table_schemas[0..table_schema_gen_count];
+        };
+        return final_table_schemas;
     }
 };
 
@@ -1184,12 +1210,68 @@ test "genSchema" {
         sex: bool,
         hobby: ?[]const u8,
         company_id: i64,
+        skill_id: i64,
 
         // has to be pub as if not zig may not compile it
         pub const primary_key = [_][]const u8{"id"};
-        pub const relations = .{ .{ "company_id", Company, "id", RelationOpts{} }, .{ "id", Skill, "id", RelationOpts{ .cardinality = .many_to_many } } };
+        pub const relations = .{
+            .{ "company_id", Company, "id", RelationOpts{ .cardinality = .one_to_one } },
+            .{ "skill_id", Skill, "id", RelationOpts{ .cardinality = .many_to_many } },
+        };
         pub const unique_cols = [_][]const u8{"company_id"};
     };
+    {
+        const user_table = SchemaUtil.genSchemaOne(User);
+
+        try testing.expectEqualSlices(u8, "User", user_table.table_name);
+        try testing.expectEqualDeep(&[_]TableSchema.Column{
+            TableSchema.Column{
+                .name = "id",
+                .type = ValueType{ .INT64 = undefined },
+                .opts = ColOpts{ .unique = true, .nullable = false },
+            },
+            TableSchema.Column{
+                .name = "name",
+                .type = ValueType{ .TEXT = undefined },
+                .opts = ColOpts{},
+            },
+            TableSchema.Column{
+                .name = "sex",
+                .type = ValueType{ .BOOL = undefined },
+                .opts = ColOpts{},
+            },
+            TableSchema.Column{
+                .name = "hobby",
+                .type = ValueType{ .TEXT = undefined },
+                .opts = ColOpts{ .nullable = true },
+            },
+            TableSchema.Column{
+                .name = "company_id",
+                .type = ValueType{ .INT64 = undefined },
+                .opts = ColOpts{ .unique = true },
+            },
+            TableSchema.Column{
+                .name = "skill_id",
+                .type = ValueType{ .INT64 = undefined },
+                .opts = ColOpts{},
+            },
+        }, user_table.columns);
+
+        try testing.expectEqual(true, user_table.has_foreign_key);
+        try testing.expectEqualDeep(&[_]TableSchema.ForeignKey{
+            TableSchema.ForeignKey{
+                .name = "fk_User_Company_id_o2o",
+                .col_name = "company_id",
+                .table_name = "Company",
+                .table_col_name = "id",
+                .opts = RelationOpts{
+                    .cardinality = .one_to_one,
+                },
+            },
+        }, user_table.foreign_keys);
+
+        try testing.expectEqualDeep(&[_][]const u8{"id"}, user_table.primary_key_names);
+    }
     {
         const tables = SchemaUtil.genSchema(.{ User, Company, Skill });
         try testing.expectEqual(4, tables.len);
@@ -1202,76 +1284,147 @@ test "genSchema" {
         // user_table
 
         try testing.expectEqualSlices(u8, "User", user_table.table_name);
-        try testing.expectEqual(true, user_table.relation_checked);
-        try testing.expectEqualDeep(&[_][]const u8{ "id", "name", "sex", "hobby", "company_id" }, user_table.col_names);
-        try testing.expectEqualDeep(&[_]ValueType{
-            ValueType{ .INT64 = undefined },
-            ValueType{ .TEXT = undefined },
-            ValueType{ .BOOL = undefined },
-            ValueType{ .TEXT = undefined },
-            ValueType{ .INT64 = undefined },
-        }, user_table.col_types);
-
-        try testing.expectEqual(5, user_table.col_opts.len);
-        try testing.expectEqual(false, user_table.col_opts[0].nullable);
-        try testing.expectEqual(true, user_table.col_opts[3].nullable);
-        try testing.expectEqual(true, user_table.col_opts[4].unique);
+        try testing.expectEqualDeep(&[_]TableSchema.Column{
+            TableSchema.Column{
+                .name = "id",
+                .type = ValueType{ .INT64 = undefined },
+                .opts = ColOpts{ .unique = true, .nullable = false },
+            },
+            TableSchema.Column{
+                .name = "name",
+                .type = ValueType{ .TEXT = undefined },
+                .opts = ColOpts{},
+            },
+            TableSchema.Column{
+                .name = "sex",
+                .type = ValueType{ .BOOL = undefined },
+                .opts = ColOpts{},
+            },
+            TableSchema.Column{
+                .name = "hobby",
+                .type = ValueType{ .TEXT = undefined },
+                .opts = ColOpts{ .nullable = true },
+            },
+            TableSchema.Column{
+                .name = "company_id",
+                .type = ValueType{ .INT64 = undefined },
+                .opts = ColOpts{ .unique = true },
+            },
+            TableSchema.Column{
+                .name = "skill_id",
+                .type = ValueType{ .INT64 = undefined },
+                .opts = ColOpts{},
+            },
+        }, user_table.columns);
 
         try testing.expectEqual(true, user_table.has_foreign_key);
-        try testing.expectEqualDeep(
-            &[_][]const u8{"fk_User_Company_id_o2o"},
-            user_table.foreign_key_names,
-        );
-        try testing.expectEqualDeep(&[_][]const u8{"company_id"}, user_table.foreign_key_col_names);
-        try testing.expectEqualDeep(&[_][]const u8{"Company"}, user_table.foreign_key_target_table_names);
-        try testing.expectEqualDeep(&[_][]const u8{"id"}, user_table.foreign_key_target_col_names);
-        try testing.expectEqualDeep(&[_]RelationOpts{RelationOpts{ .cardinality = .one_to_one }}, user_table.foreign_key_relation_optss);
+        try testing.expectEqualDeep(&[_]TableSchema.ForeignKey{
+            TableSchema.ForeignKey{
+                .name = "fk_User_Company_id_o2o",
+                .col_name = "company_id",
+                .table_name = "Company",
+                .table_col_name = "id",
+                .opts = RelationOpts{
+                    .cardinality = .one_to_one,
+                },
+            },
+        }, user_table.foreign_keys);
 
         try testing.expectEqualDeep(&[_][]const u8{"id"}, user_table.primary_key_names);
 
         // company_table
 
         try testing.expectEqualSlices(u8, "Company", company_table.table_name);
-        try testing.expectEqual(true, company_table.relation_checked);
-        try testing.expectEqualDeep(&[_][]const u8{ "id", "name" }, company_table.col_names);
-        try testing.expectEqualDeep(&[_]ValueType{
-            ValueType{ .INT64 = undefined },
-            ValueType{ .TEXT = undefined },
-        }, company_table.col_types);
+        try testing.expectEqualDeep(&[_]TableSchema.Column{
+            TableSchema.Column{
+                .name = "id",
+                .type = ValueType{ .INT64 = undefined },
+                .opts = ColOpts{ .unique = true, .nullable = false },
+            },
+            TableSchema.Column{
+                .name = "name",
+                .type = ValueType{ .TEXT = undefined },
+                .opts = ColOpts{},
+            },
+        }, company_table.columns);
+
+        try testing.expectEqualDeep(&[_][]const u8{"id"}, company_table.primary_key_names);
+
         try testing.expectEqual(false, company_table.has_foreign_key);
-        try testing.expect(company_table.foreign_key_names.len == 0);
+        try testing.expectEqual(0, company_table.foreign_keys.len);
 
         try testing.expectEqual(true, company_table.has_indexes);
-        try testing.expectEqualDeep(&[_][]const u8{"idx_Company_name"}, company_table.index_names);
-        try testing.expectEqualDeep(&[_][]const u8{"name"}, company_table.index_keys);
-        try testing.expectEqualDeep(&[_]IndexOpts{IndexOpts{}}, company_table.index_optss);
+        try testing.expectEqualDeep(&[_]TableSchema.Index{
+            TableSchema.Index{
+                .name = "idx_Company_name",
+                .keys = "name",
+                .opts = IndexOpts{},
+            },
+        }, company_table.indexes);
 
         // skill_table
 
         try testing.expectEqualSlices(u8, "Skill", skill_table.table_name);
-        try testing.expectEqual(true, skill_table.relation_checked);
+        try testing.expectEqualDeep(&[_]TableSchema.Column{
+            TableSchema.Column{
+                .name = "id",
+                .type = ValueType{ .INT64 = undefined },
+                .opts = ColOpts{ .unique = true, .nullable = false },
+            },
+            TableSchema.Column{
+                .name = "name",
+                .type = ValueType{ .TEXT = undefined },
+                .opts = ColOpts{},
+            },
+        }, skill_table.columns);
+
+        try testing.expectEqualDeep(&[_][]const u8{"id"}, skill_table.primary_key_names);
+        try testing.expectEqual(false, skill_table.has_foreign_key);
+        try testing.expectEqual(0, skill_table.foreign_keys.len);
+        try testing.expectEqual(false, skill_table.has_indexes);
+        try testing.expectEqual(0, skill_table.indexes.len);
 
         // m2m_table
 
-        try testing.expectEqualSlices(u8, "m2m_Skill_id_User_id", m2m_table.table_name);
-        try testing.expectEqual(true, m2m_table.relation_checked);
-        try testing.expectEqualDeep(&[_][]const u8{ "id", "User_id", "Skill_id" }, m2m_table.col_names);
-        try testing.expectEqualDeep(&[_]ValueType{
-            ValueType{ .INT64 = undefined },
-            ValueType{ .INT64 = undefined },
-            ValueType{ .INT64 = undefined },
-        }, m2m_table.col_types);
-        try testing.expectEqual(true, m2m_table.has_foreign_key);
-        try testing.expectEqual(false, m2m_table.has_indexes);
-        try testing.expectEqualDeep(&[_][]const u8{ "fk_m2m_Skill_id_User_id_0", "fk_m2m_Skill_id_User_id_1" }, m2m_table.foreign_key_names);
-        try testing.expectEqualDeep(&[_][]const u8{ "User_id", "Skill_id" }, m2m_table.foreign_key_col_names);
-        try testing.expectEqualDeep(&[_][]const u8{ "User", "Skill" }, m2m_table.foreign_key_target_table_names);
-        try testing.expectEqualDeep(&[_][]const u8{ "id", "id" }, m2m_table.foreign_key_target_col_names);
-        try testing.expectEqualDeep(&[_]RelationOpts{
-            RelationOpts{ .cardinality = .many_to_one },
-            RelationOpts{ .cardinality = .many_to_one },
-        }, m2m_table.foreign_key_relation_optss);
+        try testing.expectEqualSlices(u8, "m2m_Skill_id_User_skill_id", m2m_table.table_name);
+        try testing.expectEqualDeep(&[_]TableSchema.Column{
+            TableSchema.Column{
+                .name = "id",
+                .type = ValueType{ .INT64 = undefined },
+                .opts = ColOpts{ .unique = true, .nullable = false },
+            },
+            TableSchema.Column{
+                .name = "User_skill_id",
+                .type = ValueType{ .INT64 = undefined },
+                .opts = ColOpts{},
+            },
+            TableSchema.Column{
+                .name = "Skill_id",
+                .type = ValueType{ .INT64 = undefined },
+                .opts = ColOpts{},
+            },
+        }, m2m_table.columns);
+
         try testing.expectEqualDeep(&[_][]const u8{"id"}, m2m_table.primary_key_names);
+
+        try testing.expectEqual(true, m2m_table.has_foreign_key);
+        try testing.expectEqualDeep(&[_]TableSchema.ForeignKey{
+            TableSchema.ForeignKey{
+                .name = "fk_m2m_Skill_id_User_skill_id_0",
+                .col_name = "User_skill_id",
+                .table_name = "User",
+                .table_col_name = "skill_id",
+                .opts = RelationOpts{ .cardinality = .many_to_one },
+            },
+            TableSchema.ForeignKey{
+                .name = "fk_m2m_Skill_id_User_skill_id_1",
+                .col_name = "Skill_id",
+                .table_name = "Skill",
+                .table_col_name = "id",
+                .opts = RelationOpts{ .cardinality = .many_to_one },
+            },
+        }, m2m_table.foreign_keys);
+
         try testing.expectEqual(false, m2m_table.has_indexes);
     }
 }

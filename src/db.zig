@@ -98,7 +98,7 @@ pub const TableSchema = struct {
     };
     pub const Index = struct {
         name: []const u8 = undefined,
-        keys: []const u8 = undefined,
+        keys: []const []const u8 = undefined,
         opts: IndexOpts = undefined,
     };
     pub const Dependency = struct {
@@ -318,20 +318,16 @@ pub const SchemaUtil = struct {
     }
 
     /// will return a comma joined key array, like id,name
-    fn calcIndexKey(comptime decl_index: anytype) []const u8 {
+    fn calcIndexKey(comptime decl_index: anytype) []const []const u8 {
         comptime {
             if (!isTuple(@TypeOf(decl_index))) {
                 @compileError("each entry in indexes must be tuple, fund:" ++ @typeName(@TypeOf(decl_index)));
             }
-            var key: []const u8 = "";
+            var keys: [decl_index[0].len][]const u8 = undefined;
             for (0..decl_index[0].len) |j| {
-                if (j == 0) {
-                    key = key ++ decl_index[0][j];
-                } else {
-                    key = key ++ "," ++ decl_index[0][j];
-                }
+                keys[j] = decl_index[0][j];
             }
-            return key;
+            return &keys;
         }
     }
 
@@ -720,6 +716,18 @@ pub const SchemaUtil = struct {
         };
         return final_table_schemas;
     }
+
+    pub inline fn dumpTableDependencies(table_schemas: []TableSchema) void {
+        for (table_schemas) |table_schema| {
+            std.debug.print("table {s} dependencies:", .{table_schema.table_name});
+            if (table_schema.has_foreign_key) {
+                for (table_schema.foreign_keys) |fk| {
+                    std.debug.print("{s}, ", .{fk.table_name});
+                }
+            }
+            std.debug.print("\n", .{});
+        }
+    }
 };
 
 // constraint
@@ -1079,7 +1087,7 @@ pub const DbVTable = struct {
     implQueryFinalize: *const fn (ctx: *anyopaque, query: *Query) usize,
 
     implMigrate: *const fn (ctx: *anyopaque, db: *Db, migration: *Migration, direction: MigrateDirection) Error!void,
-    implCreateTable: *const fn (ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, col_names: [][]const u8, col_types: []ValueType, opts: CreateTableOpts) Error!void,
+    implCreateTable: *const fn (ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_schema: TableSchema, opts: CreateTableOpts) Error!void,
     implDropTable: *const fn (ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, opts: DropTableOpts) Error!void,
     implRenameTable: *const fn (ctx: *anyopaque, db: *Db, chagne_set: *ChangeSet, from_table_name: []const u8, to_table_name: []const u8, opts: RenameTableOpts) Error!void,
     implHasTable: *const fn (ctx: *anyopaque, db: *Db, table_name: []const u8) Error!bool,
@@ -1178,6 +1186,7 @@ pub const TableAvailablity = union(enum) {
 pub const TableAvailablityMap = struct {
     arena: std.heap.ArenaAllocator,
     map: std.StringArrayHashMap(TableAvailablity),
+    to_create_count: usize,
 
     pub fn deinit(this: *TableAvailablityMap) void {
         this.arena.deinit();
@@ -1188,8 +1197,13 @@ pub const TableAvailablityMap = struct {
 pub fn validateTableSchemas(this: *Db, allocator: std.mem.Allocator, table_schemas: []TableSchema) !TableAvailablityMap {
     var arena = std.heap.ArenaAllocator.init(allocator);
     var known_tables = std.StringArrayHashMap(TableAvailablity).init(arena.allocator());
+    var buf: [8192]u8 = undefined;
 
     for (table_schemas) |table_schema| {
+        if (known_tables.contains(table_schema.table_name)) {
+            const msg = try std.fmt.bufPrint(&buf, "repeated table schema '{s}' found!", .{table_schema.table_name});
+            @panic(msg);
+        }
         try known_tables.put(
             table_schema.table_name,
             TableAvailablity{
@@ -1200,7 +1214,6 @@ pub fn validateTableSchemas(this: *Db, allocator: std.mem.Allocator, table_schem
         );
     }
 
-    var buf: [8192]u8 = undefined;
     for (table_schemas) |table_schema| {
         if (try this.hasTable(table_schema.table_name)) {
             const msg = try std.fmt.bufPrint(&buf, "table '{s}' alreay exists!", .{table_schema.table_name});
@@ -1236,6 +1249,7 @@ pub fn validateTableSchemas(this: *Db, allocator: std.mem.Allocator, table_schem
     return .{
         .arena = arena,
         .map = known_tables,
+        .to_create_count = table_schemas.len,
     };
 }
 
@@ -1252,16 +1266,61 @@ pub fn freeTableAvailability(table_availability: *TableAvailablityMap) void {
     table_availability.deinit();
 }
 
-pub fn createTables(this: *Db, table_schemas: []TableSchema) Error!void {
+fn createTableToChangeSet(this: *Db, change_set: *ChangeSet, table_schema: TableSchema, table_avalibility: *TableAvailablityMap, table_created: *std.StringHashMap(void), opts: DbVTable.CreateTableOpts) Error!void {
+    try this.vtable.implCreateTable(this.ctx, this, change_set, table_schema, opts);
+
+    var it = table_avalibility.map.iterator();
+    while (it.next()) |e| {
+        var ta = if (table_avalibility.map.getPtr(e.key_ptr.*)) |v| v else unreachable;
+        _ = ta.to_create.dependency_map.remove(table_schema.table_name);
+    }
+
+    table_avalibility.to_create_count -= 1;
+    try table_created.put(table_schema.table_name, {});
+}
+
+pub fn createTables(this: *Db, change_set: *ChangeSet, table_schemas: []TableSchema, opts: DbVTable.CreateTableOpts) Error!void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
 
-    const table_avalibility = try this.validateTableSchemas(arena.allocator(), table_schemas);
-    _ = table_avalibility;
+    var table_created = std.StringHashMap(void).init(arena.allocator());
+    defer table_created.deinit();
+
+    var table_avalibility = try this.validateTableSchemas(arena.allocator(), table_schemas);
+
+    while (table_avalibility.to_create_count > 0) {
+        const to_create_table_schema = brk: {
+            var it = table_avalibility.map.iterator();
+            while (it.next()) |e| {
+                if (table_created.contains(e.key_ptr.*)) {
+                    continue;
+                }
+                switch (e.value_ptr.*) {
+                    .existed => continue,
+                    .to_create => {
+                        if (e.value_ptr.to_create.dependency_map.count() == 0) {
+                            for (0..table_schemas.len) |j| {
+                                if (std.mem.eql(u8, table_schemas[j].table_name, e.key_ptr.*)) {
+                                    break :brk table_schemas[j];
+                                }
+                            }
+                            std.debug.print("impossible, can not find table {s} in table_schemas", .{e.key_ptr.*});
+                            unreachable;
+                        }
+                    },
+                }
+            }
+            SchemaUtil.dumpTableDependencies(table_schemas);
+            @panic("Can not find any table to start from table_schemas provided, there is circular dependencies, please check above dump list!");
+        };
+        try this.createTableToChangeSet(change_set, to_create_table_schema, &table_avalibility, &table_created, opts);
+    }
 }
 
 pub inline fn createTable(this: *Db, change_set: *ChangeSet, ent: TableSchema, opts: DbVTable.CreateTableOpts) Error!void {
-    try this.vtable.implCreateTable(this.ctx, this, change_set, ent.table_name, ent.col_names, ent.col_types, opts);
+    var table_schemas: [1]TableSchema = undefined;
+    table_schemas[0] = ent;
+    try this.createTables(change_set, &table_schemas, opts);
 }
 
 pub inline fn dropTable(this: *Db, change_set: *ChangeSet, ent: TableSchema, opts: DbVTable.DropTableOpts) Error!void {
@@ -1463,7 +1522,7 @@ test "genSchema" {
         try testing.expectEqualDeep(&[_]TableSchema.Index{
             TableSchema.Index{
                 .name = "idx_Company_name",
-                .keys = "name",
+                .keys = &[_][]const u8{"name"},
                 .opts = IndexOpts{},
             },
         }, company_table.indexes);

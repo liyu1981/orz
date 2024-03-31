@@ -18,6 +18,7 @@ const SchemaUtil = generalDb.SchemaUtil;
 const RelationOpts = generalDb.RelationOpts;
 const IndexOpts = generalDb.IndexOpts;
 const Constraint = generalDb.Constraint;
+const TableSchema = generalDb.TableSchema;
 
 const is64 = @sizeOf(usize) == 8;
 
@@ -370,19 +371,52 @@ pub const SqliteDb = struct {
         }
     }
 
-    fn createTable(ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, col_names: [][]const u8, col_types: []ValueType, opts: DbVTable.CreateTableOpts) Error!void {
+    fn createTable(
+        ctx: *anyopaque,
+        db: *Db,
+        change_set: *ChangeSet,
+        table_schema: TableSchema,
+        opts: DbVTable.CreateTableOpts,
+    ) Error!void {
         const s: *SqliteDb = @ptrCast(@alignCast(ctx));
         _ = opts;
         var sql_buf = std.ArrayList(u8).init(s.allocator);
         defer sql_buf.deinit();
         const sql_writer = sql_buf.writer();
-        std.debug.assert(col_names.len == col_types.len);
-        try sql_writer.print("CREATE TABLE '{s}' (", .{table_name});
-        for (0..col_names.len) |i| {
+        try sql_writer.print("CREATE TABLE '{s}' (", .{table_schema.table_name});
+        // columns
+        for (0..table_schema.columns.len) |i| {
+            const column = table_schema.columns[i];
             if (i > 0) {
                 try sql_writer.print(" ,", .{});
             }
-            try sql_writer.print("'{s}' {s}", .{ col_names[i], valueTypeToSqlite3Type(col_types[i]) });
+            try sql_writer.print("'{s}' {s}", .{
+                column.name,
+                valueTypeToSqlite3Type(column.type),
+            });
+            if (column.opts.unique) {
+                try sql_writer.print(" {s}", .{"UNIQUE"});
+            }
+            if (!column.opts.nullable) {
+                try sql_writer.print(" {s}", .{"NOT NULL"});
+            }
+        }
+        // primary key
+        if (table_schema.primary_key_names.len > 0) {
+            try sql_writer.print(" , PRIMARY KEY (", .{});
+            for (0..table_schema.primary_key_names.len) |i| {
+                if (i != 0) {
+                    try sql_writer.print(",", .{});
+                }
+                try sql_writer.print("'{s}'", .{table_schema.primary_key_names[i]});
+            }
+            try sql_writer.print(")", .{});
+        }
+        // foreign keys
+        if (table_schema.has_foreign_key) {
+            for (table_schema.foreign_keys) |fk| {
+                try sql_writer.print(", CONSTRAINT {s} FOREIGN KEY('{s}') REFERENCES '{s}'('{s}')", .{ fk.name, fk.col_name, fk.table_name, fk.table_col_name });
+            }
         }
         try sql_writer.print(")", .{});
         try change_set.append(Query{
@@ -390,6 +424,26 @@ pub const SqliteDb = struct {
             .db = db,
             .raw_query = try sql_buf.toOwnedSliceSentinel(0),
         });
+
+        // indexes
+        if (table_schema.has_indexes) {
+            for (table_schema.indexes) |index| {
+                sql_buf.clearRetainingCapacity();
+                try sql_writer.print("CREATE INDEX \"{s}\" ON \"{s}\"(", .{ index.name, table_schema.table_name });
+                for (0..index.keys.len) |i| {
+                    if (i != 0) {
+                        try sql_writer.print(",", .{});
+                    }
+                    try sql_writer.print("'{s}'", .{index.keys[i]});
+                }
+                try sql_writer.print(")", .{});
+                try change_set.append(Query{
+                    .allocator = s.allocator,
+                    .db = db,
+                    .raw_query = try sql_buf.toOwnedSliceSentinel(0),
+                });
+            }
+        }
     }
 
     fn dropTable(ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, opts: DbVTable.DropTableOpts) Error!void {
@@ -748,6 +802,7 @@ test "simple_migration" {
         id: i64,
         name: []const u8,
         sex: bool,
+        hobby: ?[]const u8,
     };
 
     {
@@ -963,10 +1018,14 @@ test "complex_migration" {
         sex: bool,
         hobby: ?[]const u8,
         company_id: i64,
+        skill_id: i64,
 
         // has to be pub as if not zig may not compile it
         pub const primary_key = [_][]const u8{"id"};
-        pub const relations = .{ .{ "company_id", Company, "id", RelationOpts{} }, .{ "id", Skill, "id", RelationOpts{ .cardinality = .many_to_many } } };
+        pub const relations = .{
+            .{ "company_id", Company, "id", RelationOpts{ .cardinality = .one_to_one } },
+            .{ "skill_id", Skill, "id", RelationOpts{ .cardinality = .many_to_many } },
+        };
         pub const unique_cols = [_][]const u8{"company_id"};
     };
     {
@@ -994,9 +1053,8 @@ test "complex_migration" {
             fn up(ctx: *anyopaque) Error!?ChangeSet {
                 const m: *Self = @ptrCast(@alignCast(ctx));
                 var change_set = try ChangeSet.init(m.allocator);
-                _ = &change_set;
-                const tables = SchemaUtil.genSchema(.{ User, Company, Skill });
-                _ = tables;
+                const table_schemas = SchemaUtil.genSchema(.{ User, Company, Skill });
+                try m.db.createTables(&change_set, table_schemas, .{});
                 return change_set;
             }
         };

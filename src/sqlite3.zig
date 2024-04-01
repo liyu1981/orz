@@ -683,23 +683,19 @@ pub const SqliteDb = struct {
         // sqlite3 does not support rename index, so here we query the old def of index
         // replace the name, create new one and drop old one
         const orig_create_index_sql = brk: {
-            const Result = struct {
-                sql: []const u8,
-            };
-            var record: Result = undefined;
             try sql_writer.print("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = '{s}'", .{index_name});
             var q = try Query.init(s.allocator, db, sql_buf.items, null);
             defer q.deinit();
+            defer q.finalize();
             var rit = try q.iterator();
             var maybe_row = try rit.next();
             if (maybe_row) |*row| {
-                try QueryRow.into(row, Result, &record);
+                const record = try row.initInto(struct { sql: []const u8 = undefined });
+                break :brk record.sql;
             } else {
                 std.debug.print("index '{s}' does not exist!\n", .{index_name});
                 unreachable;
             }
-            q.finalize();
-            break :brk record.sql;
         };
         defer s.allocator.free(orig_create_index_sql);
         // create a new index with different name
@@ -914,7 +910,7 @@ test "query" {
         var rit = try q.iterator();
         var maybe_row = try rit.next();
         if (maybe_row) |*row| {
-            try QueryRow.into(row, Record, &record);
+            try QueryRow.into(row, &record);
             defer record.free(testing.allocator);
             try testing.expectEqualDeep(Record{ .col1 = 1, .name = "hello", .col3 = 5.0 }, record);
         } else {

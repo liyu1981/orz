@@ -893,7 +893,7 @@ pub const Query = struct {
                 if (i >= dest_slice.len) {
                     return error.QueryIntoOutOfBounds;
                 }
-                try QueryRow.into(row, DestType, &dest_slice[i]);
+                try QueryRow.into(row, &dest_slice[i]);
                 i += 1;
             } else break;
         }
@@ -912,7 +912,7 @@ pub const Query = struct {
                 if (i >= arr.len) {
                     arr = try this.allocator.realloc(arr, arr.len * 2);
                 }
-                try QueryRow.into(row, DestType, &arr[i]);
+                try QueryRow.into(row, &arr[i]);
                 i += 1;
             } else break;
         }
@@ -967,7 +967,7 @@ pub const QueryRow = struct {
         }
     }
 
-    pub fn into(row: *QueryRow, DestType: type, dest: *DestType) !void {
+    fn implInto(row: *QueryRow, comptime DestType: type, dest: *DestType) !void {
         const dest_typeinfo = @typeInfo(DestType);
         switch (dest_typeinfo) {
             .Struct => {},
@@ -996,6 +996,31 @@ pub const QueryRow = struct {
                 }
             }
         }
+    }
+
+    pub fn into(row: *QueryRow, dest: anytype) !void {
+        const ti = @typeInfo(@TypeOf(dest));
+        switch (ti) {
+            .Pointer => {},
+            else => {
+                @compileError("dest must be pointer to struct, found:" ++ @typeName(@TypeOf(dest)));
+            },
+        }
+        try row.implInto(@typeInfo(@TypeOf(dest)).Pointer.child, dest);
+    }
+
+    /// DestType must be initalbe by DestType{}, i.e., provide default value for all fields
+    pub fn initInto(row: *QueryRow, comptime DestType: type) !DestType {
+        var v: DestType = DestType{};
+        try row.implInto(DestType, &v);
+        return v;
+    }
+
+    /// DestType will be allocated by allocator and owned by user
+    pub fn initIntoAlloc(row: *QueryRow, comptime DestType: type, allocator: std.mem.Allocator) !DestType {
+        const v = try allocator.create(DestType);
+        try row.implInto(DestType, v);
+        return v;
     }
 };
 

@@ -19,8 +19,9 @@ const RelationOpts = generalDb.RelationOpts;
 const IndexOpts = generalDb.IndexOpts;
 const Constraint = generalDb.Constraint;
 const TableSchema = generalDb.TableSchema;
+const ColOpts = generalDb.ColOpts;
 
-const is64 = @sizeOf(usize) == 8;
+const is_x64 = @sizeOf(usize) == 8;
 
 pub const SqliteDb = struct {
     allocator: std.mem.Allocator,
@@ -83,8 +84,13 @@ pub const SqliteDb = struct {
                 .implAddColumn = addColumn,
                 .implDropColumn = dropColumn,
                 .implRenameColumn = renameColumn,
+                .implAlterColumn = alterColumn,
                 .implCreateConstraint = createConstraint,
                 .implDropConstraint = dropConstraint,
+                .implCreateIndex = createIndex,
+                .implDropIndex = dropIndex,
+                .implRenameIndex = renameIndex,
+                .implHasIndex = hasIndex,
             },
         };
     }
@@ -129,6 +135,18 @@ pub const SqliteDb = struct {
             .FLOAT32, .FLOAT64 => return "REAL",
             .TEXT => return "TEXT",
             .BLOB => return "BLOB",
+        }
+    }
+
+    fn valueType2Sqlite3DefaultValueStr(writer: std.ArrayList(u8).Writer, vt: ValueType) !void {
+        switch (vt) {
+            .NULL => unreachable,
+            .BOOL => if (vt.BOOL) try writer.print("1", .{}) else try writer.print("0", .{}),
+            .INT8, .INT16, .INT32, .INT64 => |iv| try writer.print("{d}", .{iv}),
+            .UINT8, .UINT16, .UINT32, .UINT64 => |iv| try writer.print("{d}", .{iv}),
+            .FLOAT32, .FLOAT64 => |fv| try writer.print("{d}", .{fv}),
+            .TEXT => |tv| try writer.print("'{s}'", .{tv}),
+            .BLOB => unreachable,
         }
     }
 
@@ -282,7 +300,7 @@ pub const SqliteDb = struct {
         switch (sqlite3.sqlite3_column_type(s.stmt, col_idx)) {
             sqlite3.SQLITE_INTEGER => {
                 const value = brk: {
-                    if (is64) {
+                    if (is_x64) {
                         const i64v = sqlite3.sqlite3_column_int64(s.stmt, col_idx);
                         break :brk ValueType{ .INT64 = i64v };
                     } else {
@@ -371,6 +389,49 @@ pub const SqliteDb = struct {
         }
     }
 
+    fn genColumnDef(sql_writer: std.ArrayList(u8).Writer, table_name: []const u8, column: TableSchema.Column) Error!void {
+        try sql_writer.print("'{s}' {s}", .{
+            column.name,
+            valueTypeToSqlite3Type(column.type),
+        });
+        if (column.opts.unique) {
+            try sql_writer.print(" {s}", .{"UNIQUE"});
+        }
+        if (!column.opts.nullable) {
+            try sql_writer.print(" {s}", .{"NOT NULL"});
+        }
+        if (column.opts.auto_increment) {
+            std.debug.print("auto_increment (for table '{s}' column '{s}') has no effect in sqlite3 to normal column, and should be avoided to id column, see https://www.sqlite.org/autoinc.html. Please leave it with default value (false).\n", .{ table_name, column.name });
+            unreachable;
+        }
+        if (column.opts.collate_method) |cm| {
+            try sql_writer.print(" COLLATE {s}", .{cm});
+        }
+        if (column.opts.default_value) |dv| {
+            try sql_writer.print(" DEFAULT ", .{});
+            try valueType2Sqlite3DefaultValueStr(sql_writer, dv);
+        }
+    }
+
+    fn genCreateIndexSql(sql_writer: std.ArrayList(u8).Writer, table_name: []const u8, index: TableSchema.Index) Error!void {
+        try sql_writer.print("CREATE", .{});
+        if (index.opts.unique) {
+            try sql_writer.print(" UNIQUE", .{});
+        }
+        try sql_writer.print(" INDEX \"{s}\" ON \"{s}\"(", .{ index.name, table_name });
+        for (0..index.keys.len) |i| {
+            if (i != 0) {
+                try sql_writer.print(",", .{});
+            }
+            try sql_writer.print("'{s}'", .{index.keys[i]});
+            switch (index.opts.sortings[i]) {
+                .asc => try sql_writer.print(" ASC", .{}),
+                .desc => try sql_writer.print(" DESC", .{}),
+            }
+        }
+        try sql_writer.print(")", .{});
+    }
+
     fn createTable(
         ctx: *anyopaque,
         db: *Db,
@@ -390,16 +451,7 @@ pub const SqliteDb = struct {
             if (i > 0) {
                 try sql_writer.print(" ,", .{});
             }
-            try sql_writer.print("'{s}' {s}", .{
-                column.name,
-                valueTypeToSqlite3Type(column.type),
-            });
-            if (column.opts.unique) {
-                try sql_writer.print(" {s}", .{"UNIQUE"});
-            }
-            if (!column.opts.nullable) {
-                try sql_writer.print(" {s}", .{"NOT NULL"});
-            }
+            try genColumnDef(sql_writer, table_schema.table_name, column);
         }
         // primary key
         if (table_schema.primary_key_names.len > 0) {
@@ -429,14 +481,7 @@ pub const SqliteDb = struct {
         if (table_schema.has_indexes) {
             for (table_schema.indexes) |index| {
                 sql_buf.clearRetainingCapacity();
-                try sql_writer.print("CREATE INDEX \"{s}\" ON \"{s}\"(", .{ index.name, table_schema.table_name });
-                for (0..index.keys.len) |i| {
-                    if (i != 0) {
-                        try sql_writer.print(",", .{});
-                    }
-                    try sql_writer.print("'{s}'", .{index.keys[i]});
-                }
-                try sql_writer.print(")", .{});
+                try genCreateIndexSql(sql_writer, table_schema.table_name, index);
                 try change_set.append(Query{
                     .allocator = s.allocator,
                     .db = db,
@@ -484,13 +529,14 @@ pub const SqliteDb = struct {
         return row_affected > 0;
     }
 
-    fn addColumn(ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, col_name: []const u8, col_type: ValueType, opts: DbVTable.AddColumnOpts) Error!void {
+    fn addColumn(ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, column: TableSchema.Column, opts: DbVTable.AddColumnOpts) Error!void {
         const s: *SqliteDb = @ptrCast(@alignCast(ctx));
         _ = opts;
         var sql_buf = std.ArrayList(u8).init(s.allocator);
         defer sql_buf.deinit();
         const sql_writer = sql_buf.writer();
-        try sql_writer.print("ALTER TABLE '{s}' ADD '{s}' {s}", .{ table_name, col_name, valueTypeToSqlite3Type(col_type) });
+        try sql_writer.print("ALTER TABLE '{s}' ADD ", .{table_name});
+        try genColumnDef(sql_writer, table_name, column);
         try change_set.append(Query{
             .allocator = s.allocator,
             .db = db,
@@ -526,6 +572,48 @@ pub const SqliteDb = struct {
         });
     }
 
+    fn alterColumn(ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, col_name: []const u8, new_type: ValueType, new_col_opts: ColOpts, opts: DbVTable.AlterColumnOpts) Error!void {
+        const s: *SqliteDb = @ptrCast(@alignCast(ctx));
+        _ = opts;
+        var sql_buf = std.ArrayList(u8).init(s.allocator);
+        defer sql_buf.deinit();
+        const sql_writer = sql_buf.writer();
+        // sqlite3 do not support alter table, so we have to basically create new table and then change and drop table,
+        // this is mostly best effort as many moving parts may fail
+        const alter_tmp_table_name = brk: {
+            try sql_writer.print("{s}_alter_tmp", .{table_name});
+            break :brk try sql_buf.toOwnedSlice();
+        };
+        defer s.allocator.free(alter_tmp_table_name);
+        {
+            sql_buf.clearRetainingCapacity();
+            try sql_writer.print("CREATE TABLE '{s}' AS SELECT * FROM \"{s}\"", .{ alter_tmp_table_name, table_name });
+            try change_set.append(Query{
+                .allocator = s.allocator,
+                .db = db,
+                .raw_query = try sql_buf.toOwnedSliceSentinel(0),
+            });
+        }
+        try db.dropColumn(change_set, alter_tmp_table_name, col_name, .{});
+        try db.addColumn(
+            change_set,
+            alter_tmp_table_name,
+            TableSchema.Column{ .name = col_name, .type = new_type, .opts = new_col_opts },
+            .{},
+        );
+        {
+            sql_buf.clearRetainingCapacity();
+            try sql_writer.print("INSERT INTO \"{s}\" (\"{s}\") SELECT \"{s}\" FROM \"{s}\"", .{ alter_tmp_table_name, col_name, col_name, table_name });
+            try change_set.append(Query{
+                .allocator = s.allocator,
+                .db = db,
+                .raw_query = try sql_buf.toOwnedSliceSentinel(0),
+            });
+        }
+        try db.dropTable(change_set, table_name, .{});
+        try db.renameTable(change_set, alter_tmp_table_name, table_name, .{});
+    }
+
     fn createConstraint(ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, constraint: Constraint, opts: DbVTable.CreateConstraintOpts) Error!void {
         const s: *SqliteDb = @ptrCast(@alignCast(ctx));
         _ = opts;
@@ -556,6 +644,88 @@ pub const SqliteDb = struct {
             .db = db,
             .raw_query = try sql_buf.toOwnedSliceSentinel(0),
         });
+    }
+
+    fn createIndex(ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, index: TableSchema.Index, opts: DbVTable.CreateIndexOpts) Error!void {
+        const s: *SqliteDb = @ptrCast(@alignCast(ctx));
+        _ = opts;
+        var sql_buf = std.ArrayList(u8).init(s.allocator);
+        defer sql_buf.deinit();
+        const sql_writer = sql_buf.writer();
+        try genCreateIndexSql(sql_writer, table_name, index);
+        try change_set.append(Query{
+            .allocator = s.allocator,
+            .db = db,
+            .raw_query = try sql_buf.toOwnedSliceSentinel(0),
+        });
+    }
+
+    fn dropIndex(ctx: *anyopaque, db: *Db, change_set: *ChangeSet, index_name: []const u8, opts: DbVTable.DropIndexOpts) Error!void {
+        const s: *SqliteDb = @ptrCast(@alignCast(ctx));
+        _ = opts;
+        var sql_buf = std.ArrayList(u8).init(s.allocator);
+        defer sql_buf.deinit();
+        const sql_writer = sql_buf.writer();
+        try sql_writer.print("DROP INDEX \"{s}\"", .{index_name});
+        try change_set.append(Query{
+            .allocator = s.allocator,
+            .db = db,
+            .raw_query = try sql_buf.toOwnedSliceSentinel(0),
+        });
+    }
+
+    fn renameIndex(ctx: *anyopaque, db: *Db, change_set: *ChangeSet, index_name: []const u8, new_index_name: []const u8, opts: DbVTable.RenameIndexOpts) Error!void {
+        const s: *SqliteDb = @ptrCast(@alignCast(ctx));
+        _ = opts;
+        var sql_buf = std.ArrayList(u8).init(s.allocator);
+        defer sql_buf.deinit();
+        const sql_writer = sql_buf.writer();
+        // sqlite3 does not support rename index, so here we query the old def of index
+        // replace the name, create new one and drop old one
+        const orig_create_index_sql = brk: {
+            const Result = struct {
+                sql: []const u8,
+            };
+            var record: Result = undefined;
+            try sql_writer.print("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = '{s}'", .{index_name});
+            var q = try Query.init(s.allocator, db, sql_buf.items, null);
+            defer q.deinit();
+            var rit = try q.iterator();
+            var maybe_row = try rit.next();
+            if (maybe_row) |*row| {
+                try QueryRow.into(row, Result, &record);
+            } else {
+                std.debug.print("index '{s}' does not exist!\n", .{index_name});
+                unreachable;
+            }
+            q.finalize();
+            break :brk record.sql;
+        };
+        defer s.allocator.free(orig_create_index_sql);
+        // create a new index with different name
+        {
+            const new_create_index_sql =
+                try std.mem.replaceOwned(u8, s.allocator, orig_create_index_sql, index_name, new_index_name);
+            defer s.allocator.free(new_create_index_sql);
+            const new_create_index_sqlz = try s.allocator.dupeZ(u8, new_create_index_sql);
+            try change_set.append(Query{
+                .allocator = s.allocator,
+                .db = db,
+                .raw_query = new_create_index_sqlz,
+            });
+        }
+        // drop the old index
+        try db.dropIndex(change_set, index_name, .{});
+    }
+
+    fn hasIndex(ctx: *anyopaque, db: *Db, index_name: []const u8) Error!bool {
+        const s: *SqliteDb = @ptrCast(@alignCast(ctx));
+        var sql_buf = std.ArrayList(u8).init(s.allocator);
+        defer sql_buf.deinit();
+        const sql_writer = sql_buf.writer();
+        try sql_writer.print("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = '{s}'", .{index_name});
+        const rows_affected = try db.queryExecuteSlice(s.allocator, sql_buf.items);
+        return rows_affected > 0;
     }
 
     // extern interfaces of sqlite3
@@ -1005,7 +1175,7 @@ test "complex_migration" {
         id: i64,
         name: []const u8,
         pub const indexes = .{
-            .{ [_][]const u8{"name"}, IndexOpts{} },
+            .{ [_][]const u8{"name"}, IndexOpts{ .unique = true, .sortings = &[1]IndexOpts.Sorting{.desc} } },
         };
     };
     const Skill = struct {
@@ -1022,11 +1192,13 @@ test "complex_migration" {
 
         // has to be pub as if not zig may not compile it
         pub const primary_key = [_][]const u8{"id"};
+        pub const col_opts = .{
+            .{ "company_id", ColOpts{ .unique = true } },
+        };
         pub const relations = .{
             .{ "company_id", Company, "id", RelationOpts{ .cardinality = .one_to_one } },
             .{ "skill_id", Skill, "id", RelationOpts{ .cardinality = .many_to_many } },
         };
-        pub const unique_cols = [_][]const u8{"company_id"};
     };
     {
         var sdb = try SqliteDb.init(testing.allocator, ":memory:", .{});
@@ -1062,15 +1234,48 @@ test "complex_migration" {
         var my_migration = MyMigration{ .allocator = testing.allocator, .db = &db };
         var migration = my_migration.getMigration();
         try db.migrateUp(&migration);
+
+        const MyMigration2 = struct {
+            const Self = @This();
+            allocator: std.mem.Allocator,
+            db: *Db,
+
+            pub fn getMigration(this: *Self) Migration {
+                return Migration{
+                    .id = "2",
+                    .ctx = this,
+                    .vtable = .{
+                        .up = up,
+                    },
+                };
+            }
+
+            // vtable fns
+            fn up(ctx: *anyopaque) Error!?ChangeSet {
+                const m: *Self = @ptrCast(@alignCast(ctx));
+                var change_set = try ChangeSet.init(m.allocator);
+                const user_table_schema = SchemaUtil.genSchemaOne(User);
+                const new_col_type = user_table_schema.columns[3].type;
+                var new_col_opts = user_table_schema.columns[3].opts;
+                new_col_opts.nullable = false;
+                new_col_opts.default_value = ValueType{ .TEXT = "woodworking" };
+                try m.db.alterColumn(&change_set, user_table_schema.table_name, "hobby", new_col_type, new_col_opts, .{});
+                return change_set;
+            }
+        };
+
+        var my_migration2 = MyMigration2{ .allocator = testing.allocator, .db = &db };
+        var migration2 = my_migration2.getMigration();
+        try db.migrateUp(&migration2);
     }
 }
 
-test "validateTableSchemas" {
+test "validate_table_schemas" {
     const Company = struct {
         id: i64,
         name: []const u8,
         pub const indexes = .{
-            .{ [_][]const u8{"name"}, IndexOpts{} },
+            .{ [_][]const u8{"name"}, IndexOpts{ .unique = true, .sortings = &[1]IndexOpts.Sorting{.desc} } },
         };
     };
     const Skill = struct {
@@ -1087,11 +1292,13 @@ test "validateTableSchemas" {
 
         // has to be pub as if not zig may not compile it
         pub const primary_key = [_][]const u8{"id"};
+        pub const col_opts = .{
+            .{ "company_id", ColOpts{ .unique = true } },
+        };
         pub const relations = .{
             .{ "company_id", Company, "id", RelationOpts{ .cardinality = .one_to_one } },
             .{ "skill_id", Skill, "id", RelationOpts{ .cardinality = .many_to_many } },
         };
-        pub const unique_cols = [_][]const u8{"company_id"};
     };
     const TestUtil = struct {
         var buf = std.ArrayList([]const u8).init(testing.allocator);
@@ -1130,5 +1337,83 @@ test "validateTableSchemas" {
 
         const m2m_entry = if (table_availability.map.get("m2m_Skill_id_User_skill_id")) |m| m else unreachable;
         try testing.expectEqualDeep(&[_][]const u8{ "User", "Skill" }, TestUtil.strMapKeys(m2m_entry.to_create.dependency_map));
+    }
+}
+
+test "index_funcs" {
+    const Company = struct {
+        id: i64,
+        name: []const u8,
+        location: ?[]const u8,
+        pub const indexes = .{
+            .{ [_][]const u8{"name"}, IndexOpts{ .unique = true, .sortings = &[1]IndexOpts.Sorting{.desc} } },
+        };
+    };
+    {
+        var sdb = try SqliteDb.init(testing.allocator, ":memory:", .{});
+        defer sdb.deinit();
+        var db: Db = sdb.getDb();
+        try db.open();
+        defer db.close();
+        const MyMigration = struct {
+            const Self = @This();
+            allocator: std.mem.Allocator,
+            db: *Db,
+
+            pub fn getMigration(this: *Self) Migration {
+                return Migration{
+                    .id = "1",
+                    .ctx = this,
+                    .vtable = .{
+                        .up = up,
+                        .down = down,
+                    },
+                };
+            }
+
+            // vtable fns
+            fn up(ctx: *anyopaque) Error!?ChangeSet {
+                const m: *Self = @ptrCast(@alignCast(ctx));
+                var change_set = try ChangeSet.init(m.allocator);
+                const company_table = SchemaUtil.genSchemaOne(Company);
+                try m.db.createTable(&change_set, company_table, .{});
+                try m.db.createIndex(
+                    &change_set,
+                    company_table.table_name,
+                    TableSchema.Index{
+                        .name = "idx_for_test",
+                        .keys = &[_][]const u8{"location"},
+                        .opts = .{},
+                    },
+                    .{},
+                );
+                return change_set;
+            }
+
+            fn down(ctx: *anyopaque) Error!?ChangeSet {
+                const m: *Self = @ptrCast(@alignCast(ctx));
+                var change_set = try ChangeSet.init(m.allocator);
+                const company_table = comptime SchemaUtil.genSchemaOne(Company);
+                const index_name = company_table.indexes[0].name;
+                const new_index_name = index_name ++ "_new";
+                // renameIndex will call dropIndex, so we tested dropIndex too
+                try m.db.renameIndex(
+                    &change_set,
+                    index_name,
+                    new_index_name,
+                    .{},
+                );
+                return change_set;
+            }
+        };
+
+        var my_migration = MyMigration{ .allocator = testing.allocator, .db = &db };
+        var migration = my_migration.getMigration();
+        // abuse migrateUp & migrateDown for testing
+        try db.migrateUp(&migration);
+        try testing.expectEqual(true, try db.hasIndex("idx_Company_name"));
+        try testing.expectEqual(true, try db.hasIndex("idx_for_test"));
+        try db.migrateDown(&migration);
+        try testing.expectEqual(true, try db.hasIndex("idx_Company_name_new"));
     }
 }

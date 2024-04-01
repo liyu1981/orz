@@ -58,6 +58,8 @@ pub const Error = error{
     StmtBindTooBig,
     StmtBindNomem,
     StmtBindRange,
+    RowIntoNoEqlStruct,
+    RowColIsNull,
 } || error{
     NoSpaceLeft,
 } || std.mem.Allocator.Error;
@@ -83,6 +85,27 @@ pub const DataType = enum {
 
 // schema & create
 
+pub const ColOpts = struct {
+    nullable: bool = false,
+    unique: bool = false,
+    auto_increment: bool = false,
+    default_value: ?ValueType = null,
+    collate_method: ?[]const u8 = null,
+};
+
+pub const RelationOpts = struct {
+    /// TODO: There is no one_to_many here, as essentially it can be defined from the other table with many_to_one. May be added later.
+    cardinality: enum { one_to_one, many_to_one, many_to_many } = .many_to_one,
+    delete_action: enum { cascade, restrict, no_action, set_null, set_default } = .cascade,
+    update_action: enum { cascade, restrict, no_action, set_null, set_default } = .cascade,
+};
+
+pub const IndexOpts = struct {
+    pub const Sorting = enum { asc, desc };
+    unique: bool = false,
+    sortings: []const Sorting = &[1]Sorting{.asc},
+};
+
 pub const TableSchema = struct {
     pub const Column = struct {
         name: []const u8 = undefined,
@@ -93,6 +116,7 @@ pub const TableSchema = struct {
         name: []const u8 = undefined,
         col_name: []const u8 = undefined,
         table_name: []const u8 = undefined,
+        // TODO: should we support composite foreign keys?
         table_col_name: []const u8 = undefined,
         opts: RelationOpts = undefined,
     };
@@ -115,19 +139,6 @@ pub const TableSchema = struct {
     indexes: []Index = undefined,
     dependencies: []Dependency = undefined,
 };
-
-pub const ColOpts = struct {
-    nullable: bool = false,
-    unique: bool = false,
-};
-
-pub const RelationOpts = struct {
-    cardinality: enum { one_to_one, many_to_one, many_to_many } = .many_to_one,
-    delete_action: enum { cascade, restrict, no_action, set_null, set_default } = .cascade,
-    update_action: enum { cascade, restrict, no_action, set_null, set_default } = .cascade,
-};
-
-pub const IndexOpts = struct {};
 
 pub const SchemaUtil = struct {
     fn checkEntDef(comptime EntType: type) void {
@@ -364,7 +375,7 @@ pub const SchemaUtil = struct {
             var with_decl_primary_key: bool = false;
             var with_decl_relations: bool = false;
             var with_decl_indexes: bool = false;
-            var with_decl_unique_cols: bool = false;
+            var with_decl_col_opts: bool = false;
             for (0..decls.len) |i| {
                 if (std.mem.eql(u8, decls[i].name, "relations")) {
                     with_decl_relations = true;
@@ -375,8 +386,8 @@ pub const SchemaUtil = struct {
                 if (std.mem.eql(u8, decls[i].name, "indexes")) {
                     with_decl_indexes = true;
                 }
-                if (std.mem.eql(u8, decls[i].name, "unique_cols")) {
-                    with_decl_unique_cols = true;
+                if (std.mem.eql(u8, decls[i].name, "col_opts")) {
+                    with_decl_col_opts = true;
                 }
             }
 
@@ -389,23 +400,23 @@ pub const SchemaUtil = struct {
                 ent_cols[i].opts = calcColOpts(fields[i].type);
             }
 
-            // unique cols need to be before others, especially foreign_keys
-            if (with_decl_unique_cols) {
-                const decl_unique_cols = @field(EntType, "unique_cols");
-                for (decl_unique_cols) |unique_col_name| {
+            // col_opts need to be before others, especially foreign_keys
+            if (with_decl_col_opts) {
+                const decl_col_opts = @field(EntType, "col_opts");
+                for (decl_col_opts) |entry| {
                     var col_idx: usize = 0;
                     var found_col_idx: bool = false;
                     for (0..ent_cols.len) |i| {
-                        if (std.mem.eql(u8, ent_cols[i].name, unique_col_name)) {
+                        if (std.mem.eql(u8, ent_cols[i].name, entry[0])) {
                             found_col_idx = true;
                             col_idx = i;
                             break;
                         }
                     }
                     if (!found_col_idx) {
-                        @compileError("invalid unique col name: not find '" ++ unique_col_name ++ "' in " ++ @typeName(EntType));
+                        @compileError("invalid unique col name: not find '" ++ entry[0] ++ "' in " ++ @typeName(EntType));
                     }
-                    ent_cols[col_idx].opts.unique = true;
+                    ent_cols[col_idx].opts = entry[1];
                 }
             }
 
@@ -836,6 +847,7 @@ pub const Query = struct {
     col_count: usize = 0,
     row_affected: usize = 0,
 
+    /// when init, query will be allocator.dupeZ
     pub fn init(allocator: std.mem.Allocator, db: *Db, query: []const u8, bind_args: ?[]const QueryArg) !Query {
         return .{
             .allocator = allocator,
@@ -1069,11 +1081,18 @@ pub const DbVTable = struct {
     pub const CreateTableOpts = struct {};
     pub const DropTableOpts = struct {};
     pub const RenameTableOpts = struct {};
+
     pub const AddColumnOpts = struct {};
     pub const DropColumnOpts = struct {};
     pub const RenameColumnOpts = struct {};
+    pub const AlterColumnOpts = struct {};
+
     pub const CreateConstraintOpts = struct {};
     pub const DropConstraintOpts = struct {};
+
+    pub const CreateIndexOpts = struct {};
+    pub const DropIndexOpts = struct {};
+    pub const RenameIndexOpts = struct {};
 
     implOpen: *const fn (ctx: *anyopaque) Error!void,
     implClose: *const fn (ctx: *anyopaque) void,
@@ -1091,11 +1110,16 @@ pub const DbVTable = struct {
     implDropTable: *const fn (ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, opts: DropTableOpts) Error!void,
     implRenameTable: *const fn (ctx: *anyopaque, db: *Db, chagne_set: *ChangeSet, from_table_name: []const u8, to_table_name: []const u8, opts: RenameTableOpts) Error!void,
     implHasTable: *const fn (ctx: *anyopaque, db: *Db, table_name: []const u8) Error!bool,
-    implAddColumn: *const fn (ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, col_name: []const u8, col_type: ValueType, opts: AddColumnOpts) Error!void,
+    implAddColumn: *const fn (ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, column: TableSchema.Column, opts: AddColumnOpts) Error!void,
     implDropColumn: *const fn (ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, col_name: []const u8, opts: DropColumnOpts) Error!void,
     implRenameColumn: *const fn (ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, from_col_name: []const u8, to_col_name: []const u8, opts: RenameColumnOpts) Error!void,
+    implAlterColumn: *const fn (ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, col_name: []const u8, new_type: ValueType, new_col_opts: ColOpts, opts: DbVTable.AlterColumnOpts) Error!void,
     implCreateConstraint: *const fn (ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, constraint: Constraint, opts: CreateConstraintOpts) Error!void,
     implDropConstraint: *const fn (ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, constraint_name: []const u8, opts: DropConstraintOpts) Error!void,
+    implCreateIndex: *const fn (ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, index: TableSchema.Index, opts: DbVTable.CreateIndexOpts) Error!void,
+    implDropIndex: *const fn (ctx: *anyopaque, db: *Db, change_set: *ChangeSet, index_name: []const u8, opts: DbVTable.DropIndexOpts) Error!void,
+    implRenameIndex: *const fn (ctx: *anyopaque, db: *Db, change_set: *ChangeSet, index_name: []const u8, new_index_name: []const u8, opts: DbVTable.RenameIndexOpts) Error!void,
+    implHasIndex: *const fn (ctx: *anyopaque, db: *Db, index_name: []const u8) Error!bool,
 };
 
 // top level Db namespace starts here
@@ -1323,8 +1347,8 @@ pub inline fn createTable(this: *Db, change_set: *ChangeSet, ent: TableSchema, o
     try this.createTables(change_set, &table_schemas, opts);
 }
 
-pub inline fn dropTable(this: *Db, change_set: *ChangeSet, ent: TableSchema, opts: DbVTable.DropTableOpts) Error!void {
-    try this.vtable.implDropTable(this.ctx, this, change_set, ent.table_name, opts);
+pub inline fn dropTable(this: *Db, change_set: *ChangeSet, table_name: []const u8, opts: DbVTable.DropTableOpts) Error!void {
+    try this.vtable.implDropTable(this.ctx, this, change_set, table_name, opts);
 }
 
 pub inline fn renameTable(this: *Db, change_set: *ChangeSet, from_table_name: []const u8, to_table_name: []const u8, opts: DbVTable.RenameTableOpts) Error!void {
@@ -1335,8 +1359,8 @@ pub inline fn hasTable(this: *Db, table_name: []const u8) Error!bool {
     return try this.vtable.implHasTable(this.ctx, this, table_name);
 }
 
-pub inline fn addColumn(this: *Db, change_set: *ChangeSet, table_name: []const u8, col_name: []const u8, col_type: ValueType, opts: DbVTable.AddColumnOpts) Error!void {
-    try this.vtable.implAddColumn(this.ctx, this, change_set, table_name, col_name, col_type, opts);
+pub inline fn addColumn(this: *Db, change_set: *ChangeSet, table_name: []const u8, column: TableSchema.Column, opts: DbVTable.AddColumnOpts) Error!void {
+    try this.vtable.implAddColumn(this.ctx, this, change_set, table_name, column, opts);
 }
 
 pub inline fn dropColumn(this: *Db, change_set: *ChangeSet, table_name: []const u8, col_name: []const u8, opts: DbVTable.DropColumnOpts) Error!void {
@@ -1347,12 +1371,32 @@ pub inline fn renameColumn(this: *Db, change_set: *ChangeSet, table_name: []cons
     try this.vtable.implRenameColumn(this.ctx, this, change_set, table_name, from_col_name, to_col_name, opts);
 }
 
+pub inline fn alterColumn(this: *Db, change_set: *ChangeSet, table_name: []const u8, col_name: []const u8, new_type: ValueType, new_col_opts: ColOpts, opts: DbVTable.AlterColumnOpts) Error!void {
+    try this.vtable.implAlterColumn(this.ctx, this, change_set, table_name, col_name, new_type, new_col_opts, opts);
+}
+
 pub inline fn createConstraint(this: *Db, change_set: *ChangeSet, table_name: []const u8, constraint: Constraint, opts: DbVTable.CreateConstraintOpts) Error!void {
     try this.vtable.implCreateConstraint(this.ctx, this, change_set, table_name, constraint, opts);
 }
 
 pub inline fn dropConstraint(this: *Db, change_set: *ChangeSet, table_name: []const u8, constraint_name: []const u8, opts: DbVTable.DropConstraintOpts) Error!void {
     try this.vtable.implDropConstraint(this.ctx, this, change_set, table_name, constraint_name, opts);
+}
+
+pub inline fn createIndex(this: *Db, change_set: *ChangeSet, table_name: []const u8, index: TableSchema.Index, opts: DbVTable.CreateIndexOpts) Error!void {
+    try this.vtable.implCreateIndex(this.ctx, this, change_set, table_name, index, opts);
+}
+
+pub inline fn dropIndex(this: *Db, change_set: *ChangeSet, index_name: []const u8, opts: DbVTable.DropIndexOpts) Error!void {
+    try this.vtable.implDropIndex(this.ctx, this, change_set, index_name, opts);
+}
+
+pub inline fn renameIndex(this: *Db, change_set: *ChangeSet, index_name: []const u8, new_index_name: []const u8, opts: DbVTable.RenameIndexOpts) Error!void {
+    try this.vtable.implRenameIndex(this.ctx, this, change_set, index_name, new_index_name, opts);
+}
+
+pub inline fn hasIndex(this: *Db, index_name: []const u8) Error!bool {
+    return this.vtable.implHasIndex(this.ctx, this, index_name);
 }
 
 // all tests
@@ -1362,7 +1406,7 @@ test "genSchema" {
         id: i64,
         name: []const u8,
         pub const indexes = .{
-            .{ [_][]const u8{"name"}, IndexOpts{} },
+            .{ [_][]const u8{"name"}, IndexOpts{ .unique = true, .sortings = &[1]IndexOpts.Sorting{.desc} } },
         };
     };
     const Skill = struct {
@@ -1379,11 +1423,14 @@ test "genSchema" {
 
         // has to be pub as if not zig may not compile it
         pub const primary_key = [_][]const u8{"id"};
+        pub const col_opts = .{
+            .{ "id", ColOpts{ .auto_increment = true } },
+            .{ "company_id", ColOpts{ .unique = true } },
+        };
         pub const relations = .{
             .{ "company_id", Company, "id", RelationOpts{ .cardinality = .one_to_one } },
             .{ "skill_id", Skill, "id", RelationOpts{ .cardinality = .many_to_many } },
         };
-        pub const unique_cols = [_][]const u8{"company_id"};
     };
     {
         const user_table = SchemaUtil.genSchemaOne(User);
@@ -1393,7 +1440,7 @@ test "genSchema" {
             TableSchema.Column{
                 .name = "id",
                 .type = ValueType{ .INT64 = undefined },
-                .opts = ColOpts{ .unique = true, .nullable = false },
+                .opts = ColOpts{ .unique = true, .nullable = false, .auto_increment = true },
             },
             TableSchema.Column{
                 .name = "name",
@@ -1453,7 +1500,7 @@ test "genSchema" {
             TableSchema.Column{
                 .name = "id",
                 .type = ValueType{ .INT64 = undefined },
-                .opts = ColOpts{ .unique = true, .nullable = false },
+                .opts = ColOpts{ .unique = true, .nullable = false, .auto_increment = true },
             },
             TableSchema.Column{
                 .name = "name",
@@ -1523,7 +1570,7 @@ test "genSchema" {
             TableSchema.Index{
                 .name = "idx_Company_name",
                 .keys = &[_][]const u8{"name"},
-                .opts = IndexOpts{},
+                .opts = IndexOpts{ .unique = true, .sortings = &[1]IndexOpts.Sorting{.desc} },
             },
         }, company_table.indexes);
 

@@ -1129,6 +1129,8 @@ pub const QueryCol = struct {
     }
 };
 
+// query builder
+
 // change set
 
 pub const ChangeSet = struct {
@@ -1196,8 +1198,12 @@ pub const DbVTable = struct {
         error_if_exist: bool = true,
     };
     pub const MigrateDirection = enum { up, down };
-    pub const CreateTableOpts = struct {};
-    pub const DropTableOpts = struct {};
+    pub const CreateTableOpts = struct {
+        if_not_exists: bool = false,
+    };
+    pub const DropTableOpts = struct {
+        if_exists: bool = false,
+    };
     pub const RenameTableOpts = struct {};
 
     pub const AddColumnOpts = struct {};
@@ -1215,8 +1221,12 @@ pub const DbVTable = struct {
     pub const CreateConstraintOpts = struct {};
     pub const DropConstraintOpts = struct {};
 
-    pub const CreateIndexOpts = struct {};
-    pub const DropIndexOpts = struct {};
+    pub const CreateIndexOpts = struct {
+        if_not_exists: bool = false,
+    };
+    pub const DropIndexOpts = struct {
+        if_exists: bool = false,
+    };
     pub const RenameIndexOpts = struct {};
 
     implOpen: *const fn (ctx: *anyopaque) Error!void,

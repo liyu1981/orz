@@ -425,12 +425,19 @@ pub const SqliteDb = struct {
         }
     }
 
-    fn genCreateIndexSql(sql_writer: std.ArrayList(u8).Writer, table_name: []const u8, index: TableSchema.Index) Error!void {
+    fn genCreateIndexSql(sql_writer: std.ArrayList(u8).Writer, table_name: []const u8, index: TableSchema.Index, opts: DbVTable.CreateIndexOpts) Error!void {
         try sql_writer.print("CREATE", .{});
         if (index.opts.unique) {
             try sql_writer.print(" UNIQUE", .{});
         }
-        try sql_writer.print(" INDEX \"{s}\" ON \"{s}\"(", .{ index.name, table_name });
+        try sql_writer.print(
+            " INDEX {s} \"{s}\" ON \"{s}\"(",
+            .{
+                if (opts.if_not_exists) "IF NOT EXISTS" else "",
+                index.name,
+                table_name,
+            },
+        );
         for (0..index.keys.len) |i| {
             if (i != 0) {
                 try sql_writer.print(",", .{});
@@ -466,11 +473,16 @@ pub const SqliteDb = struct {
         opts: DbVTable.CreateTableOpts,
     ) Error!void {
         const s: *SqliteDb = @ptrCast(@alignCast(ctx));
-        _ = opts;
         var sql_buf = std.ArrayList(u8).init(s.allocator);
         defer sql_buf.deinit();
         const sql_writer = sql_buf.writer();
-        try sql_writer.print("CREATE TABLE '{s}' (", .{table_schema.table_name});
+        try sql_writer.print(
+            "CREATE TABLE '{s}' {s} (",
+            .{
+                table_schema.table_name,
+                if (opts.if_not_exists) "IF NOT EXISTS" else "",
+            },
+        );
         // columns
         for (0..table_schema.columns.len) |i| {
             const column = table_schema.columns[i];
@@ -516,7 +528,7 @@ pub const SqliteDb = struct {
         if (table_schema.indexes.len > 0) {
             for (table_schema.indexes) |index| {
                 sql_buf.clearRetainingCapacity();
-                try genCreateIndexSql(sql_writer, table_schema.table_name, index);
+                try genCreateIndexSql(sql_writer, table_schema.table_name, index, .{});
                 try change_set.append(Query{
                     .allocator = s.allocator,
                     .db = db,
@@ -528,11 +540,13 @@ pub const SqliteDb = struct {
 
     fn dropTable(ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, opts: DbVTable.DropTableOpts) Error!void {
         const s: *SqliteDb = @ptrCast(@alignCast(ctx));
-        _ = opts;
         var sql_buf = std.ArrayList(u8).init(s.allocator);
         defer sql_buf.deinit();
         const sql_writer = sql_buf.writer();
-        try sql_writer.print("DROP TABLE '{s}'", .{table_name});
+        try sql_writer.print("DROP TABLE {s} '{s}'", .{
+            if (opts.if_exists) "IF EXISTS" else "",
+            table_name,
+        });
         try change_set.append(Query{
             .allocator = s.allocator,
             .db = db,
@@ -691,45 +705,31 @@ pub const SqliteDb = struct {
     }
 
     fn createConstraint(ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, constraint: Constraint, opts: DbVTable.CreateConstraintOpts) Error!void {
-        const s: *SqliteDb = @ptrCast(@alignCast(ctx));
+        _ = ctx;
         _ = opts;
-        var sql_buf = std.ArrayList(u8).init(s.allocator);
-        defer sql_buf.deinit();
-        const sql_writer = sql_buf.writer();
-        _ = sql_writer;
         _ = table_name;
         _ = constraint;
-        std.debug.print("Sqlite3 has no way to create constraint outside create table statement!\n", .{});
-        try change_set.append(Query{
-            .allocator = s.allocator,
-            .db = db,
-            .raw_query = try sql_buf.toOwnedSliceSentinel(0),
-        });
+        _ = db;
+        _ = change_set;
+        std.debug.print("Sqlite3 does not support create constraint outside create table statement! This operation will result nothing added to change set.\n", .{});
     }
 
     fn dropConstraint(ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, constraint_name: []const u8, opts: DbVTable.DropConstraintOpts) Error!void {
-        const s: *SqliteDb = @ptrCast(@alignCast(ctx));
+        _ = ctx;
         _ = opts;
-        var sql_buf = std.ArrayList(u8).init(s.allocator);
-        defer sql_buf.deinit();
-        const sql_writer = sql_buf.writer();
-        _ = sql_writer;
         _ = table_name;
         _ = constraint_name;
-        try change_set.append(Query{
-            .allocator = s.allocator,
-            .db = db,
-            .raw_query = try sql_buf.toOwnedSliceSentinel(0),
-        });
+        _ = db;
+        _ = change_set;
+        std.debug.print("Sqlite3 does not support drop constraint. This operation will result nothing added to change set.\n", .{});
     }
 
     fn createIndex(ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, index: TableSchema.Index, opts: DbVTable.CreateIndexOpts) Error!void {
         const s: *SqliteDb = @ptrCast(@alignCast(ctx));
-        _ = opts;
         var sql_buf = std.ArrayList(u8).init(s.allocator);
         defer sql_buf.deinit();
         const sql_writer = sql_buf.writer();
-        try genCreateIndexSql(sql_writer, table_name, index);
+        try genCreateIndexSql(sql_writer, table_name, index, opts);
         try change_set.append(Query{
             .allocator = s.allocator,
             .db = db,
@@ -739,11 +739,16 @@ pub const SqliteDb = struct {
 
     fn dropIndex(ctx: *anyopaque, db: *Db, change_set: *ChangeSet, index_name: []const u8, opts: DbVTable.DropIndexOpts) Error!void {
         const s: *SqliteDb = @ptrCast(@alignCast(ctx));
-        _ = opts;
         var sql_buf = std.ArrayList(u8).init(s.allocator);
         defer sql_buf.deinit();
         const sql_writer = sql_buf.writer();
-        try sql_writer.print("DROP INDEX \"{s}\"", .{index_name});
+        try sql_writer.print(
+            "DROP INDEX {s} \"{s}\"",
+            .{
+                if (opts.if_exists) "IF EXISTS" else "",
+                index_name,
+            },
+        );
         try change_set.append(Query{
             .allocator = s.allocator,
             .db = db,

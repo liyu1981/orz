@@ -20,6 +20,7 @@ const IndexOpts = generalDb.IndexOpts;
 const Constraint = generalDb.Constraint;
 const TableSchema = generalDb.TableSchema;
 const ColOpts = generalDb.ColOpts;
+const ViewOpts = generalDb.ViewOpts;
 
 const is_x64 = @sizeOf(usize) == 8;
 
@@ -85,6 +86,8 @@ pub const SqliteDb = struct {
                 .implDropColumn = dropColumn,
                 .implRenameColumn = renameColumn,
                 .implAlterColumn = alterColumn,
+                .implCreateView = createView,
+                .implDropView = dropView,
                 .implCreateConstraint = createConstraint,
                 .implDropConstraint = dropConstraint,
                 .implCreateIndex = createIndex,
@@ -389,6 +392,15 @@ pub const SqliteDb = struct {
         }
     }
 
+    fn genNameSeq(sql_writer: std.ArrayList(u8).Writer, names: []const []const u8) Error!void {
+        for (0..names.len) |i| {
+            if (i != 0) {
+                try sql_writer.print(" ,", .{});
+            }
+            try sql_writer.print("'{s}'", .{names[i]});
+        }
+    }
+
     fn genColumnDef(sql_writer: std.ArrayList(u8).Writer, table_name: []const u8, column: TableSchema.Column) Error!void {
         try sql_writer.print("'{s}' {s}", .{
             column.name,
@@ -424,12 +436,26 @@ pub const SqliteDb = struct {
                 try sql_writer.print(",", .{});
             }
             try sql_writer.print("'{s}'", .{index.keys[i]});
-            switch (index.opts.sortings[i]) {
-                .asc => try sql_writer.print(" ASC", .{}),
-                .desc => try sql_writer.print(" DESC", .{}),
+            if (index.opts.sortings) |sortings| {
+                switch (sortings[i]) {
+                    .asc => try sql_writer.print(" ASC", .{}),
+                    .desc => try sql_writer.print(" DESC", .{}),
+                }
             }
         }
         try sql_writer.print(")", .{});
+    }
+
+    fn genConflictHandling(sql_writer: std.ArrayList(u8).Writer, on_conflict: ?Constraint.ConflictHandling) Error!void {
+        if (on_conflict) |oc| {
+            switch (oc) {
+                .rollback => try sql_writer.print(" ON CONFLICT ROLLBACK", .{}),
+                .abort => try sql_writer.print(" ON CONFLICT ABORT", .{}),
+                .fail => try sql_writer.print(" ON CONFLICT FAIL", .{}),
+                .ignore => try sql_writer.print(" ON CONFLICT IGNORE", .{}),
+                .replace => try sql_writer.print(" ON CONFLICT REPLACE", .{}),
+            }
+        }
     }
 
     fn createTable(
@@ -454,20 +480,29 @@ pub const SqliteDb = struct {
             try genColumnDef(sql_writer, table_schema.table_name, column);
         }
         // primary key
-        if (table_schema.primary_key_names.len > 0) {
+        if (table_schema.primary_key.col_names.len > 0) {
             try sql_writer.print(" , PRIMARY KEY (", .{});
-            for (0..table_schema.primary_key_names.len) |i| {
+            for (0..table_schema.primary_key.col_names.len) |i| {
                 if (i != 0) {
                     try sql_writer.print(",", .{});
                 }
-                try sql_writer.print("'{s}'", .{table_schema.primary_key_names[i]});
+                try sql_writer.print("'{s}'", .{table_schema.primary_key.col_names[i]});
             }
             try sql_writer.print(")", .{});
+            try genConflictHandling(sql_writer, table_schema.primary_key.on_conflict);
         }
         // foreign keys
-        if (table_schema.has_foreign_key) {
+        if (table_schema.foreign_keys.len > 0) {
             for (table_schema.foreign_keys) |fk| {
-                try sql_writer.print(", CONSTRAINT {s} FOREIGN KEY('{s}') REFERENCES '{s}'('{s}')", .{ fk.name, fk.col_name, fk.table_name, fk.table_col_name });
+                if (fk.name) |name| {
+                    try sql_writer.print(", CONSTRAINT {s} FOREIGN KEY(", .{name});
+                } else {
+                    try sql_writer.print(", FOREIGN KEY(", .{});
+                }
+                try genNameSeq(sql_writer, fk.col_names);
+                try sql_writer.print(") REFERENCES '{s}'(", .{fk.ref_table_name});
+                try genNameSeq(sql_writer, fk.ref_table_col_names);
+                try sql_writer.print(")", .{});
             }
         }
         try sql_writer.print(")", .{});
@@ -478,7 +513,7 @@ pub const SqliteDb = struct {
         });
 
         // indexes
-        if (table_schema.has_indexes) {
+        if (table_schema.indexes.len > 0) {
             for (table_schema.indexes) |index| {
                 sql_buf.clearRetainingCapacity();
                 try genCreateIndexSql(sql_writer, table_schema.table_name, index);
@@ -614,6 +649,47 @@ pub const SqliteDb = struct {
         try db.renameTable(change_set, alter_tmp_table_name, table_name, .{});
     }
 
+    fn createView(ctx: *anyopaque, db: *Db, change_set: *ChangeSet, view_name: []const u8, view_opts: ViewOpts, select_sql: []const u8, opts: DbVTable.CreateViewOpts) Error!void {
+        const s: *SqliteDb = @ptrCast(@alignCast(ctx));
+        var sql_buf = std.ArrayList(u8).init(s.allocator);
+        defer sql_buf.deinit();
+        const sql_writer = sql_buf.writer();
+        try sql_writer.print("CREATE{s} VIEW{s} {s}", .{
+            if (view_opts.schema == .temp) " TEMP" else "",
+            if (opts.if_not_exists) " IF NOT EXISTS" else "",
+            view_name,
+        });
+        if (view_opts.col_names.len > 0) {
+            try sql_writer.print("(", .{});
+            for (view_opts.col_names) |col_name| {
+                try sql_writer.print("'{s}' ", .{col_name});
+            }
+            try sql_writer.print(")", .{});
+        }
+        try sql_writer.print(" AS {s}", .{select_sql});
+        try change_set.append(Query{
+            .allocator = s.allocator,
+            .db = db,
+            .raw_query = try sql_buf.toOwnedSliceSentinel(0),
+        });
+    }
+
+    fn dropView(ctx: *anyopaque, db: *Db, change_set: *ChangeSet, view_name: []const u8, opts: DbVTable.DropViewOpts) Error!void {
+        const s: *SqliteDb = @ptrCast(@alignCast(ctx));
+        var sql_buf = std.ArrayList(u8).init(s.allocator);
+        defer sql_buf.deinit();
+        const sql_writer = sql_buf.writer();
+        try sql_writer.print("DROP VIEW{s} {s}", .{
+            if (opts.if_exists) " IF EXISTS" else "",
+            view_name,
+        });
+        try change_set.append(Query{
+            .allocator = s.allocator,
+            .db = db,
+            .raw_query = try sql_buf.toOwnedSliceSentinel(0),
+        });
+    }
+
     fn createConstraint(ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, constraint: Constraint, opts: DbVTable.CreateConstraintOpts) Error!void {
         const s: *SqliteDb = @ptrCast(@alignCast(ctx));
         _ = opts;
@@ -623,6 +699,7 @@ pub const SqliteDb = struct {
         _ = sql_writer;
         _ = table_name;
         _ = constraint;
+        std.debug.print("Sqlite3 has no way to create constraint outside create table statement!\n", .{});
         try change_set.append(Query{
             .allocator = s.allocator,
             .db = db,
@@ -1006,7 +1083,7 @@ test "simple_migration" {
                 const m: *Self = @ptrCast(@alignCast(ctx));
                 var change_set = try ChangeSet.init(m.allocator);
                 const user_table = SchemaUtil.genSchemaOne(User);
-                try m.db.dropTable(&change_set, user_table, .{});
+                try m.db.dropTable(&change_set, user_table.table_name, .{});
                 return change_set;
             }
         };
@@ -1044,7 +1121,16 @@ test "simple_migration" {
                 var change_set = try ChangeSet.init(m.allocator);
                 const user_table = SchemaUtil.genSchemaOne(User);
                 try m.db.createTable(&change_set, user_table, .{});
-                try m.db.addColumn(&change_set, user_table.table_name, "nickname", ValueType.getUndefined([]const u8), .{});
+                try m.db.addColumn(
+                    &change_set,
+                    user_table.table_name,
+                    TableSchema.Column{
+                        .name = "nickname",
+                        .type = ValueType.getUndefined([]const u8),
+                        .opts = .{},
+                    },
+                    .{},
+                );
                 return change_set;
             }
         };
@@ -1192,8 +1278,8 @@ test "complex_migration" {
             .{ "company_id", ColOpts{ .unique = true } },
         };
         pub const relations = .{
-            .{ "company_id", Company, "id", RelationOpts{ .cardinality = .one_to_one } },
-            .{ "skill_id", Skill, "id", RelationOpts{ .cardinality = .many_to_many } },
+            .{ "company_id", Company, "id", RelationOpts{ .association = .one_to_one } },
+            .{ "skill_id", Skill, "id", RelationOpts{ .association = .many_to_many } },
         };
     };
     {
@@ -1292,8 +1378,8 @@ test "validate_table_schemas" {
             .{ "company_id", ColOpts{ .unique = true } },
         };
         pub const relations = .{
-            .{ "company_id", Company, "id", RelationOpts{ .cardinality = .one_to_one } },
-            .{ "skill_id", Skill, "id", RelationOpts{ .cardinality = .many_to_many } },
+            .{ "company_id", Company, "id", RelationOpts{ .association = .one_to_one } },
+            .{ "skill_id", Skill, "id", RelationOpts{ .association = .many_to_many } },
         };
     };
     const TestUtil = struct {
@@ -1411,5 +1497,72 @@ test "index_funcs" {
         try testing.expectEqual(true, try db.hasIndex("idx_for_test"));
         try db.migrateDown(&migration);
         try testing.expectEqual(true, try db.hasIndex("idx_Company_name_new"));
+    }
+}
+
+test "view_funcs" {
+    const Company = struct {
+        id: i64,
+        name: []const u8,
+        location: ?[]const u8,
+        pub const indexes = .{
+            .{ [_][]const u8{"name"}, IndexOpts{ .unique = true, .sortings = &[1]IndexOpts.Sorting{.desc} } },
+        };
+    };
+    {
+        var sdb = try SqliteDb.init(testing.allocator, ":memory:", .{});
+        defer sdb.deinit();
+        var db: Db = sdb.getDb();
+        try db.open();
+        defer db.close();
+        const MyMigration = struct {
+            const Self = @This();
+            allocator: std.mem.Allocator,
+            db: *Db,
+
+            pub fn getMigration(this: *Self) Migration {
+                return Migration{
+                    .id = "1",
+                    .ctx = this,
+                    .vtable = .{
+                        .up = up,
+                        .down = down,
+                    },
+                };
+            }
+
+            // vtable fns
+            fn up(ctx: *anyopaque) Error!?ChangeSet {
+                const m: *Self = @ptrCast(@alignCast(ctx));
+                var change_set = try ChangeSet.init(m.allocator);
+                const company_table = comptime SchemaUtil.genSchemaOne(Company);
+                try m.db.createTable(&change_set, company_table, .{});
+                try m.db.createView(
+                    &change_set,
+                    "vw_company_official_name",
+                    ViewOpts{
+                        // sqlite3 does not support this, just to make it not temp
+                        .schema = .{ .name = "" },
+                        .col_names = &[_][]const u8{"name"},
+                    },
+                    "SELECT name FROM Company",
+                    .{ .if_not_exists = true },
+                );
+                return change_set;
+            }
+
+            fn down(ctx: *anyopaque) Error!?ChangeSet {
+                const m: *Self = @ptrCast(@alignCast(ctx));
+                var change_set = try ChangeSet.init(m.allocator);
+                try m.db.dropView(&change_set, "Company.vw_official_name", .{ .if_exists = true });
+                return change_set;
+            }
+        };
+
+        var my_migration = MyMigration{ .allocator = testing.allocator, .db = &db };
+        var migration = my_migration.getMigration();
+        // abuse migrateUp & migrateDown for testing
+        try db.migrateUp(&migration);
+        try db.migrateDown(&migration);
     }
 }

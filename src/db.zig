@@ -95,15 +95,79 @@ pub const ColOpts = struct {
 
 pub const RelationOpts = struct {
     /// TODO: There is no one_to_many here, as essentially it can be defined from the other table with many_to_one. May be added later.
-    cardinality: enum { one_to_one, many_to_one, many_to_many } = .many_to_one,
-    delete_action: enum { cascade, restrict, no_action, set_null, set_default } = .cascade,
-    update_action: enum { cascade, restrict, no_action, set_null, set_default } = .cascade,
+    association: enum { one_to_one, many_to_one, many_to_many } = .many_to_one,
+    on_delete: Constraint.Rule = .cascade,
+    on_update: Constraint.Rule = .cascade,
 };
 
 pub const IndexOpts = struct {
     pub const Sorting = enum { asc, desc };
     unique: bool = false,
-    sortings: []const Sorting = &[1]Sorting{.asc},
+    sortings: ?[]const Sorting = null,
+};
+
+pub const ViewOpts = struct {
+    pub const Schema = union(enum) {
+        temp: void,
+        name: []const u8,
+    };
+    schema: Schema = Schema{ .temp = {} },
+    col_names: []const []const u8 = undefined,
+};
+
+pub const Constraint = union(enum) {
+    pub const ConflictHandling = enum {
+        rollback,
+        abort,
+        fail,
+        ignore,
+        replace,
+    };
+    pub const Rule = enum {
+        set_null,
+        set_default,
+        cascade,
+        restrict,
+        no_action,
+    };
+    pub const Initially = enum {
+        deferred,
+        immediate,
+    };
+    pub const PrimaryKey = struct {
+        name: ?[]const u8 = null,
+        col_names: []const []const u8,
+        on_conflict: ?ConflictHandling = null,
+    };
+    pub const Unique = struct {
+        name: ?[]const u8 = null,
+        col_names: []const []const u8,
+        on_conflict: ?ConflictHandling = null,
+    };
+    pub const Check = struct {
+        name: ?[]const u8 = null,
+        expr: []const u8,
+    };
+    pub const Deferrable = struct {
+        not: bool,
+        initially: ?Initially = null,
+    };
+    pub const ForeignKey = struct {
+        name: ?[]const u8 = null,
+        col_names: []const []const u8,
+        ref_table_name: []const u8,
+        ref_table_col_names: []const []const u8,
+        on_delete: ?Rule = null,
+        on_update: ?Rule = null,
+        match: ?[]const u8 = null,
+        deferrable: ?Deferrable = null,
+        opts: RelationOpts,
+    };
+
+    primary_key: PrimaryKey,
+    unique: Unique,
+    check: Check,
+    foreign_key: ForeignKey,
 };
 
 pub const TableSchema = struct {
@@ -111,14 +175,6 @@ pub const TableSchema = struct {
         name: []const u8 = undefined,
         type: ValueType = undefined,
         opts: ColOpts = undefined,
-    };
-    pub const ForeignKey = struct {
-        name: []const u8 = undefined,
-        col_name: []const u8 = undefined,
-        table_name: []const u8 = undefined,
-        // TODO: should we support composite foreign keys?
-        table_col_name: []const u8 = undefined,
-        opts: RelationOpts = undefined,
     };
     pub const Index = struct {
         name: []const u8 = undefined,
@@ -132,11 +188,10 @@ pub const TableSchema = struct {
 
     table_name: []const u8 = undefined,
     columns: []Column = undefined,
-    primary_key_names: []const []const u8 = undefined,
-    has_foreign_key: bool = false,
-    foreign_keys: []ForeignKey = undefined,
-    has_indexes: bool = false,
-    indexes: []Index = undefined,
+    primary_key: Constraint.PrimaryKey,
+    foreign_keys: []Constraint.ForeignKey,
+    indexes: []Index,
+    checks: []Constraint.Check,
     dependencies: []Dependency = undefined,
 };
 
@@ -177,7 +232,7 @@ pub const SchemaUtil = struct {
                     var count: comptime_int = 0;
                     const decl_relations = @field(EntType, "relations");
                     for (decl_relations) |decl_relation| {
-                        if (decl_relation[3].cardinality == .many_to_many) {
+                        if (decl_relation[3].association == .many_to_many) {
                             count += 1;
                         }
                     }
@@ -197,6 +252,36 @@ pub const SchemaUtil = struct {
             return last_name;
         } else {
             @panic("Impossible, no last name fragment?:" ++ full_type_name);
+        }
+    }
+
+    fn toArrayOfStrings(comptime input: anytype) []const []const u8 {
+        comptime {
+            const ti = @typeInfo(@TypeOf(input));
+            // @compileLog("first:", ti, "\n");
+            switch (ti) {
+                .Pointer => |pt| {
+                    // @compileLog("second:", @typeInfo(pt.child), "\n");
+                    // @compileLog(input);
+                    if (pt.size == .Slice and pt.child == u8) {
+                        return &[_][]const u8{input};
+                    }
+                    switch (@typeInfo(pt.child)) {
+                        .Array => |at| {
+                            if (at.child == u8) {
+                                return &[_][]const u8{input};
+                            }
+                            const cti = @typeInfo(at.child);
+                            if (cti == .Array and cti.Array.child == u8) {
+                                return input;
+                            }
+                        },
+                        else => {},
+                    }
+                },
+                else => {},
+            }
+            @compileError("input is invalid!");
         }
     }
 
@@ -257,7 +342,7 @@ pub const SchemaUtil = struct {
 
             const target_table_name = getLastTypeName(decl_relation[1]);
 
-            switch (decl_relation[3].cardinality) {
+            switch (decl_relation[3].association) {
                 .one_to_one => {
                     if (!column_entry.opts.unique) {
                         @compileError("table '" ++ table_name ++ "' col '" ++ decl_relation[2] ++ "' must be unique if relation to table '" ++ target_table_name ++ "' marked as .one_to_one!");
@@ -272,7 +357,7 @@ pub const SchemaUtil = struct {
             }
 
             return "fk_" ++ table_name ++ "_" ++ target_table_name ++ "_" ++ decl_relation[2] ++ "_" ++
-                switch (decl_relation[3].cardinality) {
+                switch (decl_relation[3].association) {
                 .one_to_one => "o2o",
                 .many_to_one => "m2o",
                 .many_to_many => unreachable,
@@ -284,7 +369,7 @@ pub const SchemaUtil = struct {
         comptime table_name: []const u8,
         comptime columns: []TableSchema.Column,
         comptime decl_relations: anytype,
-        comptime fks: []TableSchema.ForeignKey,
+        comptime fks: []Constraint.ForeignKey,
     ) usize {
         comptime {
             if (!isTuple(@TypeOf(decl_relations))) {
@@ -293,7 +378,7 @@ pub const SchemaUtil = struct {
             var fk_count: usize = 0;
             for (0..decl_relations.len) |i| {
                 const decl_relation = decl_relations[i];
-                switch (decl_relation[3].cardinality) {
+                switch (decl_relation[3].association) {
                     .one_to_one, .many_to_one => {
                         fks[i].name = calcForeignKeyName(
                             table_name,
@@ -301,9 +386,9 @@ pub const SchemaUtil = struct {
                             columns[i],
                             decl_relations[i],
                         );
-                        fks[i].col_name = decl_relations[i][0];
-                        fks[i].table_name = getLastTypeName(decl_relations[i][1]);
-                        fks[i].table_col_name = decl_relations[i][2];
+                        fks[i].col_names = toArrayOfStrings(decl_relations[i][0]);
+                        fks[i].ref_table_name = getLastTypeName(decl_relations[i][1]);
+                        fks[i].ref_table_col_names = toArrayOfStrings(decl_relations[i][2]);
                         fks[i].opts = decl_relations[i][3];
                         fk_count += 1;
                     },
@@ -376,6 +461,7 @@ pub const SchemaUtil = struct {
             var with_decl_relations: bool = false;
             var with_decl_indexes: bool = false;
             var with_decl_col_opts: bool = false;
+            var with_decl_checks: bool = false;
             for (0..decls.len) |i| {
                 if (std.mem.eql(u8, decls[i].name, "relations")) {
                     with_decl_relations = true;
@@ -388,6 +474,9 @@ pub const SchemaUtil = struct {
                 }
                 if (std.mem.eql(u8, decls[i].name, "col_opts")) {
                     with_decl_col_opts = true;
+                }
+                if (std.mem.eql(u8, decls[i].name, "checks")) {
+                    with_decl_checks = true;
                 }
             }
 
@@ -420,15 +509,13 @@ pub const SchemaUtil = struct {
                 }
             }
 
-            var primary_key_names: [if (with_decl_primary_key) @field(EntType, "primary_key").len else 1][]const u8 = undefined;
+            var primary_key: Constraint.PrimaryKey = undefined;
             if (with_decl_primary_key) {
                 const decl_primary_key = @field(EntType, "primary_key");
-                for (0..decl_primary_key.len) |i| {
-                    primary_key_names[i] = decl_primary_key[i];
-                }
-                if (decl_primary_key.len == 1) {
+                primary_key.col_names = &decl_primary_key;
+                if (primary_key.col_names.len == 1) {
                     const pname_idx = brk: {
-                        const pname = primary_key_names[0];
+                        const pname = primary_key.col_names[0];
                         for (0..ent_cols.len) |i| {
                             if (std.mem.eql(u8, ent_cols[i].name, pname)) {
                                 break :brk i;
@@ -443,13 +530,13 @@ pub const SchemaUtil = struct {
                 if (ent_cols.len == 0) {
                     @compileError(@typeName(EntType) ++ " has no field can be used as primary key!");
                 }
-                primary_key_names[0] = ent_cols[0].name;
+                primary_key.col_names = &[1][]const u8{ent_cols[0].name};
                 ent_cols[0].opts.unique = true;
             }
 
             const has_foreign_key: bool = if (with_decl_relations) @field(EntType, "relations").len > 0 else false;
             const foreign_key_capacity = if (with_decl_relations) @field(EntType, "relations").len else 0;
-            var foreign_keys: [foreign_key_capacity]TableSchema.ForeignKey = undefined;
+            var foreign_keys: [foreign_key_capacity]Constraint.ForeignKey = undefined;
             const foreign_key_count = if (has_foreign_key)
                 calcForeignKeyArrays(
                     table_name,
@@ -471,14 +558,23 @@ pub const SchemaUtil = struct {
                 );
             }
 
+            const has_checks = if (with_decl_checks) @field(EntType, "checks").len > 0 else false;
+            const checks_capacity = if (with_decl_checks) @field(EntType, "checks").len else 0;
+            var checks: [checks_capacity]Constraint.Check = undefined;
+            if (has_checks) {
+                const decl_checks = @field(EntType, "checks");
+                for (decl_checks, 0..) |decl_check, i| {
+                    checks[i].expr = decl_check[0];
+                }
+            }
+
             return TableSchema{
                 .table_name = table_name,
                 .columns = &ent_cols,
-                .primary_key_names = &primary_key_names,
-                .has_foreign_key = has_foreign_key,
+                .primary_key = primary_key,
                 .foreign_keys = foreign_keys[0..foreign_key_count],
-                .has_indexes = has_indexes,
                 .indexes = &indexes,
+                .checks = &checks,
             };
         }
     }
@@ -489,7 +585,7 @@ pub const SchemaUtil = struct {
         for (target.foreign_keys) |fk| {
             const found: bool = brk: {
                 for (all_tables) |table| {
-                    if (std.mem.eql(u8, fk.table_name, table.table_name)) {
+                    if (std.mem.eql(u8, fk.ref_table_name, table.table_name)) {
                         break :brk true;
                     }
                 }
@@ -560,35 +656,36 @@ pub const SchemaUtil = struct {
             };
             _ = &ent_cols;
 
-            var foreign_keys = [_]TableSchema.ForeignKey{
-                TableSchema.ForeignKey{
+            var foreign_keys = [_]Constraint.ForeignKey{
+                Constraint.ForeignKey{
                     .name = "fk_" ++ table_name ++ "_0",
-                    .col_name = col1_name,
-                    .table_name = table1.table_name,
-                    .table_col_name = table1_col_name,
-                    .opts = RelationOpts{ .cardinality = .many_to_one },
+                    .col_names = toArrayOfStrings(col1_name),
+                    .ref_table_name = table1.table_name,
+                    .ref_table_col_names = toArrayOfStrings(table1_col_name),
+                    .opts = RelationOpts{ .association = .many_to_one },
                 },
-                TableSchema.ForeignKey{
+                Constraint.ForeignKey{
                     .name = "fk_" ++ table_name ++ "_1",
-                    .col_name = col2_name,
-                    .table_name = table2.table_name,
-                    .table_col_name = table2_col_name,
-                    .opts = RelationOpts{ .cardinality = .many_to_one },
+                    .col_names = toArrayOfStrings(col2_name),
+                    .ref_table_name = table2.table_name,
+                    .ref_table_col_names = toArrayOfStrings(table2_col_name),
+                    .opts = RelationOpts{ .association = .many_to_one },
                 },
             };
             _ = &foreign_keys;
 
-            var primary_key_names = [_][]const u8{"id"};
-            _ = &primary_key_names;
+            const primary_key = Constraint.PrimaryKey{
+                .col_names = &[_][]const u8{"id"},
+            };
             ent_cols[0].opts.unique = true;
 
             return TableSchema{
                 .table_name = table_name,
                 .columns = &ent_cols,
-                .primary_key_names = &primary_key_names,
-                .has_foreign_key = true,
+                .primary_key = primary_key,
                 .foreign_keys = &foreign_keys,
-                .has_indexes = false,
+                .indexes = &[0]TableSchema.Index{},
+                .checks = &[0]Constraint.Check{},
             };
         }
     }
@@ -624,7 +721,7 @@ pub const SchemaUtil = struct {
 
         for (0..decl_relations.len) |i| {
             const decl_relation = decl_relations[i];
-            switch (decl_relation[3].cardinality) {
+            switch (decl_relation[3].association) {
                 .one_to_one, .many_to_one => {},
                 .many_to_many => {
                     const target_col_name = decl_relation[0];
@@ -731,19 +828,15 @@ pub const SchemaUtil = struct {
     pub inline fn dumpTableDependencies(table_schemas: []TableSchema) void {
         for (table_schemas) |table_schema| {
             std.debug.print("table {s} dependencies:", .{table_schema.table_name});
-            if (table_schema.has_foreign_key) {
+            if (table_schema.foreign_keys.len > 0) {
                 for (table_schema.foreign_keys) |fk| {
-                    std.debug.print("{s}, ", .{fk.table_name});
+                    std.debug.print("{s}, ", .{fk.ref_table_name});
                 }
             }
             std.debug.print("\n", .{});
         }
     }
 };
-
-// constraint
-
-pub const Constraint = struct {};
 
 // query
 
@@ -1112,6 +1205,13 @@ pub const DbVTable = struct {
     pub const RenameColumnOpts = struct {};
     pub const AlterColumnOpts = struct {};
 
+    pub const CreateViewOpts = struct {
+        if_not_exists: bool = false,
+    };
+    pub const DropViewOpts = struct {
+        if_exists: bool = false,
+    };
+
     pub const CreateConstraintOpts = struct {};
     pub const DropConstraintOpts = struct {};
 
@@ -1139,6 +1239,8 @@ pub const DbVTable = struct {
     implDropColumn: *const fn (ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, col_name: []const u8, opts: DropColumnOpts) Error!void,
     implRenameColumn: *const fn (ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, from_col_name: []const u8, to_col_name: []const u8, opts: RenameColumnOpts) Error!void,
     implAlterColumn: *const fn (ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, col_name: []const u8, new_type: ValueType, new_col_opts: ColOpts, opts: DbVTable.AlterColumnOpts) Error!void,
+    implCreateView: *const fn (ctx: *anyopaque, db: *Db, change_set: *ChangeSet, view_name: []const u8, view_opts: ViewOpts, select_sql: []const u8, opts: CreateViewOpts) Error!void,
+    implDropView: *const fn (ctx: *anyopaque, db: *Db, change_set: *ChangeSet, view_name: []const u8, opts: DropViewOpts) Error!void,
     implCreateConstraint: *const fn (ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, constraint: Constraint, opts: CreateConstraintOpts) Error!void,
     implDropConstraint: *const fn (ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, constraint_name: []const u8, opts: DropConstraintOpts) Error!void,
     implCreateIndex: *const fn (ctx: *anyopaque, db: *Db, change_set: *ChangeSet, table_name: []const u8, index: TableSchema.Index, opts: DbVTable.CreateIndexOpts) Error!void,
@@ -1269,7 +1371,7 @@ pub fn validateTableSchemas(this: *Db, allocator: std.mem.Allocator, table_schem
             @panic(msg);
         }
 
-        if (!table_schema.has_foreign_key) {
+        if (table_schema.foreign_keys.len == 0) {
             continue;
         }
 
@@ -1278,17 +1380,17 @@ pub fn validateTableSchemas(this: *Db, allocator: std.mem.Allocator, table_schem
         };
 
         for (table_schema.foreign_keys) |fk| {
-            if (!known_tables.contains(fk.table_name)) {
-                if (try this.hasTable(fk.table_name)) {
-                    try known_tables.put(fk.table_name, TableAvailablity{ .existed = {} });
+            if (!known_tables.contains(fk.ref_table_name)) {
+                if (try this.hasTable(fk.ref_table_name)) {
+                    try known_tables.put(fk.ref_table_name, TableAvailablity{ .existed = {} });
                 } else {
-                    const msg = try std.fmt.bufPrint(&buf, "table '{s}' referenced table '{s}' in foreign key '{s}', which is neither existing in current db, nor will be created.", .{ table_schema.table_name, fk.table_name, fk.name });
+                    const msg = try std.fmt.bufPrint(&buf, "table '{s}' referenced table '{s}' in foreign key '{?s}', which is neither existing in current db, nor will be created.", .{ table_schema.table_name, fk.ref_table_name, fk.name });
                     @panic(msg);
                 }
             }
             switch (known_entry.*) {
                 .to_create => {
-                    try known_entry.to_create.dependency_map.put(fk.table_name, {});
+                    try known_entry.to_create.dependency_map.put(fk.ref_table_name, {});
                 },
                 .existed => unreachable,
             }
@@ -1400,6 +1502,14 @@ pub inline fn alterColumn(this: *Db, change_set: *ChangeSet, table_name: []const
     try this.vtable.implAlterColumn(this.ctx, this, change_set, table_name, col_name, new_type, new_col_opts, opts);
 }
 
+pub inline fn createView(this: *Db, change_set: *ChangeSet, view_name: []const u8, view_opts: ViewOpts, select_sql: []const u8, opts: DbVTable.CreateViewOpts) Error!void {
+    try this.vtable.implCreateView(this.ctx, this, change_set, view_name, view_opts, select_sql, opts);
+}
+
+pub inline fn dropView(this: *Db, change_set: *ChangeSet, view_name: []const u8, opts: DbVTable.DropViewOpts) Error!void {
+    try this.vtable.implDropView(this.ctx, this, change_set, view_name, opts);
+}
+
 pub inline fn createConstraint(this: *Db, change_set: *ChangeSet, table_name: []const u8, constraint: Constraint, opts: DbVTable.CreateConstraintOpts) Error!void {
     try this.vtable.implCreateConstraint(this.ctx, this, change_set, table_name, constraint, opts);
 }
@@ -1453,9 +1563,10 @@ test "genSchema" {
             .{ "company_id", ColOpts{ .unique = true } },
         };
         pub const relations = .{
-            .{ "company_id", Company, "id", RelationOpts{ .cardinality = .one_to_one } },
-            .{ "skill_id", Skill, "id", RelationOpts{ .cardinality = .many_to_many } },
+            .{ "company_id", Company, "id", RelationOpts{ .association = .one_to_one } },
+            .{ "skill_id", Skill, "id", RelationOpts{ .association = .many_to_many } },
         };
+        pub const checks = .{.{"name NOT IN ('User', 'Company')"}};
     };
     {
         const user_table = SchemaUtil.genSchemaOne(User);
@@ -1494,20 +1605,24 @@ test "genSchema" {
             },
         }, user_table.columns);
 
-        try testing.expectEqual(true, user_table.has_foreign_key);
-        try testing.expectEqualDeep(&[_]TableSchema.ForeignKey{
-            TableSchema.ForeignKey{
+        try testing.expectEqualDeep(&[_]Constraint.ForeignKey{
+            Constraint.ForeignKey{
                 .name = "fk_User_Company_id_o2o",
-                .col_name = "company_id",
-                .table_name = "Company",
-                .table_col_name = "id",
+                .col_names = &[_][]const u8{"company_id"},
+                .ref_table_name = "Company",
+                .ref_table_col_names = &[_][]const u8{"id"},
                 .opts = RelationOpts{
-                    .cardinality = .one_to_one,
+                    .association = .one_to_one,
                 },
             },
         }, user_table.foreign_keys);
 
-        try testing.expectEqualDeep(&[_][]const u8{"id"}, user_table.primary_key_names);
+        try testing.expectEqualDeep(
+            Constraint.PrimaryKey{
+                .col_names = &[_][]const u8{"id"},
+            },
+            user_table.primary_key,
+        );
     }
     {
         const tables = SchemaUtil.genSchema(.{ User, Company, Skill });
@@ -1554,20 +1669,33 @@ test "genSchema" {
             },
         }, user_table.columns);
 
-        try testing.expectEqual(true, user_table.has_foreign_key);
-        try testing.expectEqualDeep(&[_]TableSchema.ForeignKey{
-            TableSchema.ForeignKey{
+        try testing.expectEqualDeep(&[_]Constraint.ForeignKey{
+            Constraint.ForeignKey{
                 .name = "fk_User_Company_id_o2o",
-                .col_name = "company_id",
-                .table_name = "Company",
-                .table_col_name = "id",
+                .col_names = &[_][]const u8{"company_id"},
+                .ref_table_name = "Company",
+                .ref_table_col_names = &[_][]const u8{"id"},
                 .opts = RelationOpts{
-                    .cardinality = .one_to_one,
+                    .association = .one_to_one,
                 },
             },
         }, user_table.foreign_keys);
 
-        try testing.expectEqualDeep(&[_][]const u8{"id"}, user_table.primary_key_names);
+        try testing.expectEqualDeep(
+            Constraint.PrimaryKey{
+                .col_names = &[_][]const u8{"id"},
+            },
+            user_table.primary_key,
+        );
+
+        try testing.expectEqualDeep(
+            &[_]Constraint.Check{
+                Constraint.Check{
+                    .expr = "name NOT IN ('User', 'Company')",
+                },
+            },
+            user_table.checks,
+        );
 
         // company_table
 
@@ -1585,12 +1713,15 @@ test "genSchema" {
             },
         }, company_table.columns);
 
-        try testing.expectEqualDeep(&[_][]const u8{"id"}, company_table.primary_key_names);
+        try testing.expectEqualDeep(
+            Constraint.PrimaryKey{
+                .col_names = &[_][]const u8{"id"},
+            },
+            company_table.primary_key,
+        );
 
-        try testing.expectEqual(false, company_table.has_foreign_key);
         try testing.expectEqual(0, company_table.foreign_keys.len);
 
-        try testing.expectEqual(true, company_table.has_indexes);
         try testing.expectEqualDeep(&[_]TableSchema.Index{
             TableSchema.Index{
                 .name = "idx_Company_name",
@@ -1615,10 +1746,13 @@ test "genSchema" {
             },
         }, skill_table.columns);
 
-        try testing.expectEqualDeep(&[_][]const u8{"id"}, skill_table.primary_key_names);
-        try testing.expectEqual(false, skill_table.has_foreign_key);
+        try testing.expectEqualDeep(
+            Constraint.PrimaryKey{
+                .col_names = &[_][]const u8{"id"},
+            },
+            skill_table.primary_key,
+        );
         try testing.expectEqual(0, skill_table.foreign_keys.len);
-        try testing.expectEqual(false, skill_table.has_indexes);
         try testing.expectEqual(0, skill_table.indexes.len);
 
         // m2m_table
@@ -1642,26 +1776,30 @@ test "genSchema" {
             },
         }, m2m_table.columns);
 
-        try testing.expectEqualDeep(&[_][]const u8{"id"}, m2m_table.primary_key_names);
-
-        try testing.expectEqual(true, m2m_table.has_foreign_key);
-        try testing.expectEqualDeep(&[_]TableSchema.ForeignKey{
-            TableSchema.ForeignKey{
-                .name = "fk_m2m_Skill_id_User_skill_id_0",
-                .col_name = "User_skill_id",
-                .table_name = "User",
-                .table_col_name = "skill_id",
-                .opts = RelationOpts{ .cardinality = .many_to_one },
+        try testing.expectEqualDeep(
+            Constraint.PrimaryKey{
+                .col_names = &[_][]const u8{"id"},
             },
-            TableSchema.ForeignKey{
+            m2m_table.primary_key,
+        );
+
+        try testing.expectEqualDeep(&[_]Constraint.ForeignKey{
+            Constraint.ForeignKey{
+                .name = "fk_m2m_Skill_id_User_skill_id_0",
+                .col_names = &[_][]const u8{"User_skill_id"},
+                .ref_table_name = "User",
+                .ref_table_col_names = &[_][]const u8{"skill_id"},
+                .opts = RelationOpts{ .association = .many_to_one },
+            },
+            Constraint.ForeignKey{
                 .name = "fk_m2m_Skill_id_User_skill_id_1",
-                .col_name = "Skill_id",
-                .table_name = "Skill",
-                .table_col_name = "id",
-                .opts = RelationOpts{ .cardinality = .many_to_one },
+                .col_names = &[_][]const u8{"Skill_id"},
+                .ref_table_name = "Skill",
+                .ref_table_col_names = &[_][]const u8{"id"},
+                .opts = RelationOpts{ .association = .many_to_one },
             },
         }, m2m_table.foreign_keys);
 
-        try testing.expectEqual(false, m2m_table.has_indexes);
+        try testing.expectEqual(0, m2m_table.indexes.len);
     }
 }

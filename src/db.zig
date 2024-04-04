@@ -104,7 +104,7 @@ pub const RelationOpts = struct {
 
 pub const IndexOpts = struct {
     unique: bool = false,
-    order: ?[]const Order = null,
+    orders: ?[]const Order = null,
 };
 
 pub const ViewOpts = struct {
@@ -1374,22 +1374,63 @@ pub const SelectStmt = struct {
     limit: ?LimitClause = null,
 };
 
+pub const UpsertClause = struct {
+    pub const IndexedColumn = struct {
+        col_or_expr: union(enum) {
+            col: []const u8,
+            expr: StmtExpr,
+        },
+        collate: ?[]const u8 = null,
+        order: ?Order = null,
+    };
+    pub const ConflictTargetClause = struct {
+        indexed_columns: []const IndexedColumn,
+        where: ?StmtExpr = null,
+    };
+    pub const UpdateSetExpr = struct {
+        col_names: []const []const u8,
+        expr: StmtExpr,
+    };
+    pub const UpdateSet = struct {
+        set_exprs: []const UpdateSetExpr,
+        where: ?StmtExpr = null,
+    };
+    pub const UpdateStrategy = union(enum) {
+        nothing: void,
+        update: UpdateSet,
+    };
+
+    conflict_target: ?ConflictTargetClause = null,
+    update_strategy: UpdateStrategy,
+};
+
+pub const ReturningClause = union(enum) {
+    pub const ExprAs = struct {
+        expr: StmtExpr,
+        as: ?[]const u8 = null,
+    };
+    pub const Item = union(enum) {
+        star: void,
+        expr_as: ExprAs,
+    };
+    items: []const Item,
+};
+
 pub const InsertStmt = struct {
     pub const Payload = union(enum) {
-        values: []ValueType,
+        values: []const StmtExpr,
         sub_select: SelectStmt,
-        // TODO: need to support this?
         default_values: void,
     };
 
     verb: enum { replace, insert },
-    conflict_handling: Constraint.ConflictHandling,
-    schema_name: ?[]const u8 = null,
-    table_name: []const u8,
+    conflict_handling: ?Constraint.ConflictHandling = null,
+    qualified_table_name: QualifiedTableName,
     alias: ?[]const u8 = null,
-    col_names: ?[]const []const u8 = null,
+    col_names: []QualifiedColName,
     payload: Payload,
-    upsert_clause: ?[]const []const u8 = null,
+    upsert_clauses: []const UpsertClause = &[0]UpsertClause{},
+    returning_clause: ?ReturningClause = null,
 };
 
 pub const UpdateStmt = struct {
@@ -1420,9 +1461,13 @@ pub const QueryBuilder = struct {
         implReset: *const fn (ctx: *anyopaque) void,
         implGetSql: *const fn (ctx: *anyopaque) []const u8,
         implGetLocalType: *const fn (ctx: *anyopaque, value_type: ValueType) []const u8,
-        implBuildStmtExpr: *const fn (ctx: *anyopaque, expr: StmtExpr) Error!void,
         implBuildSelectStmt: *const fn (ctx: *anyopaque, select_stmt: SelectStmt) Error!void,
+        implBuildInsertStmt: *const fn (ctx: *anyopaque, insert_stmt: InsertStmt) Error!void,
+        implBuildUpdateStmt: *const fn (ctx: *anyopaque, update_stmt: UpdateStmt) Error!void,
+        implBuildStmtExpr: *const fn (ctx: *anyopaque, expr: StmtExpr) Error!void,
         implBuildFunctionCall: *const fn (ctx: *anyopaque, func_call: FunctionCallClause) Error!void,
+        implBuildUpsertClause: *const fn (ctx: *anyopaque, upsert_clause: UpsertClause) Error!void,
+        implBuildReturningClause: *const fn (ctx: *anyopaque, returning_clause: ReturningClause) Error!void,
     };
 
     ctx: *anyopaque,
@@ -1441,16 +1486,40 @@ pub const QueryBuilder = struct {
         return this.vtable.implGetLocalType(this.ctx, value_type);
     }
 
-    pub inline fn buildStmtExpr(this: *QueryBuilder, expr: StmtExpr) Error!void {
-        try this.vtable.implBuildStmtExpr(this.ctx, expr);
+    pub inline fn buildStmt(this: *QueryBuilder, stmt: Stmt) Error!void {
+        switch (stmt) {
+            .select => |select_stmt| try this.vtable.implBuildSelectStmt(this.ctx, select_stmt),
+            .insert => |insert_stmt| try this.vtable.implBuildInsertStmt(this.ctx, insert_stmt),
+            .update => |update_stmt| try this.vtable.implBuildUpdateStmt(this.ctx, update_stmt),
+        }
     }
 
     pub inline fn buildSelectStmt(this: *QueryBuilder, select_stmt: SelectStmt) Error!void {
         try this.vtable.implBuildSelectStmt(this.ctx, select_stmt);
     }
 
+    pub inline fn buildInsertStmt(this: *QueryBuilder, insert_stmt: InsertStmt) Error!void {
+        try this.vtable.implBuildInsertStmt(this.ctx, insert_stmt);
+    }
+
+    pub inline fn buildUpdateStmt(this: *QueryBuilder, update_stmt: UpdateStmt) Error!void {
+        try this.vtable.implBuildUpdateStmt(this.ctx, update_stmt);
+    }
+
+    pub inline fn buildStmtExpr(this: *QueryBuilder, expr: StmtExpr) Error!void {
+        try this.vtable.implBuildStmtExpr(this.ctx, expr);
+    }
+
     pub inline fn buildFunctionCall(this: *QueryBuilder, func_call: FunctionCallClause) Error!void {
         try this.vtable.implBuildFunctionCall(this.ctx, func_call);
+    }
+
+    pub inline fn buildUpsertClause(this: *QueryBuilder, upsert_clause: UpsertClause) Error!void {
+        try this.vtable.implBuildUpsertClause(this.ctx, upsert_clause);
+    }
+
+    pub inline fn buildReturningClause(this: *QueryBuilder, returning_clause: ReturningClause) Error!void {
+        try this.vtable.implBuildReturningClause(this.ctx, returning_clause);
     }
 };
 
@@ -1467,9 +1536,13 @@ pub const GeneralSQLQueryBuilder = struct {
                 .implReset = reset,
                 .implGetSql = getSql,
                 .implGetLocalType = getLocalType,
-                .implBuildStmtExpr = buildStmtExpr,
                 .implBuildSelectStmt = buildSelectStmt,
+                .implBuildInsertStmt = buildInsertStmt,
+                .implBuildUpdateStmt = buildUpdateStmt,
+                .implBuildStmtExpr = buildStmtExpr,
                 .implBuildFunctionCall = buildFunctionCall,
+                .implBuildUpsertClause = buildUpsertClause,
+                .implBuildReturningClause = buildReturningClause,
             },
         };
     }
@@ -1500,6 +1573,27 @@ pub const GeneralSQLQueryBuilder = struct {
         try sql_writer.print("\"{s}\"", .{col_name.col_name});
     }
 
+    pub fn buildSetExpr(ctx: *anyopaque, set_expr: UpsertClause.UpdateSetExpr) Error!void {
+        const b: *GeneralSQLQueryBuilder = @ptrCast(@alignCast(ctx));
+        const sql_writer = b.sql_buf.writer();
+        if (set_expr.col_names.len > 0) {
+            if (set_expr.col_names.len > 1) {
+                try sql_writer.print("(", .{});
+            }
+            for (set_expr.col_names, 0..) |col_name, i| {
+                if (i != 0) {
+                    try sql_writer.print(", ", .{});
+                }
+                try sql_writer.print("\"{s}\"", .{col_name});
+            }
+            if (set_expr.col_names.len > 1) {
+                try sql_writer.print(")", .{});
+            }
+        }
+        try sql_writer.print(" = ", .{});
+        try buildStmtExpr(ctx, set_expr.expr);
+    }
+
     // vtable fns
     fn reset(ctx: *anyopaque) void {
         const b: *GeneralSQLQueryBuilder = @ptrCast(@alignCast(ctx));
@@ -1515,6 +1609,100 @@ pub const GeneralSQLQueryBuilder = struct {
         _ = ctx;
         std.debug.print("Using the general getLocalType impl, usually is not what you want! This is only for generaldb testing. \n", .{});
         return @tagName(value_type);
+    }
+
+    fn buildSelectStmt(ctx: *anyopaque, select_stmt: SelectStmt) Error!void {
+        const b: *GeneralSQLQueryBuilder = @ptrCast(@alignCast(ctx));
+        const sql_writer = b.sql_buf.writer();
+        for (select_stmt.compound_select, 0..) |cs, i| {
+            if (i != 0) {
+                try sql_writer.print(" ", .{});
+            }
+            try buildCompoundSelect(ctx, cs);
+        }
+        if (select_stmt.order_by) |order_by| {
+            _ = order_by;
+        }
+        if (select_stmt.limit) |limit| {
+            _ = limit;
+        }
+    }
+
+    fn buildInsertStmt(ctx: *anyopaque, insert_stmt: InsertStmt) Error!void {
+        const b: *GeneralSQLQueryBuilder = @ptrCast(@alignCast(ctx));
+        const sql_writer = b.sql_buf.writer();
+
+        switch (insert_stmt.verb) {
+            .replace => try sql_writer.print("REPLACE INTO ", .{}),
+            .insert => {
+                try sql_writer.print("INSERT ", .{});
+                if (insert_stmt.conflict_handling) |ch| {
+                    switch (ch) {
+                        .abort => try sql_writer.print("OR ABORT ", .{}),
+                        .fail => try sql_writer.print("OR FAIL ", .{}),
+                        .ignore => try sql_writer.print("OR IGNORE ", .{}),
+                        .replace => try sql_writer.print("OR REPLACE ", .{}),
+                        .rollback => try sql_writer.print("OR ROLLBACK ", .{}),
+                    }
+                }
+                try sql_writer.print("INTO ", .{});
+            },
+        }
+
+        try buildQualifiedTableName(sql_writer, insert_stmt.qualified_table_name);
+        if (insert_stmt.alias) |a| {
+            try sql_writer.print(" AS {s} ", .{a});
+        }
+
+        if (insert_stmt.col_names.len > 0) {
+            try sql_writer.print("(", .{});
+            for (insert_stmt.col_names, 0..) |col_name, i| {
+                if (i != 0) {
+                    try sql_writer.print(", ", .{});
+                }
+                try sql_writer.print("{s}", .{col_name.col_name});
+            }
+            try sql_writer.print(")", .{});
+        }
+
+        switch (insert_stmt.payload) {
+            .values => |v_arr| {
+                try sql_writer.print(" VALUES ( ", .{});
+                for (v_arr, 0..) |v, i| {
+                    if (i != 0) {
+                        try sql_writer.print(", ", .{});
+                    }
+                    try buildStmtExpr(ctx, v);
+                }
+                try sql_writer.print(" )", .{});
+            },
+            .sub_select => |select_stmt| {
+                try buildSelectStmt(ctx, select_stmt);
+            },
+            .default_values => try sql_writer.print("DEFAULT VALUES", .{}),
+        }
+
+        if (insert_stmt.upsert_clauses.len > 0 and insert_stmt.payload != .default_values) {
+            try sql_writer.print(" ", .{});
+            for (insert_stmt.upsert_clauses, 0..) |upsert_clause, i| {
+                if (i != 0) {
+                    try sql_writer.print(", ", .{});
+                }
+                try buildUpsertClause(ctx, upsert_clause);
+            }
+        }
+
+        if (insert_stmt.returning_clause) |returning_clause| {
+            try sql_writer.print(" ", .{});
+            try buildReturningClause(ctx, returning_clause);
+        }
+    }
+
+    fn buildUpdateStmt(ctx: *anyopaque, update_stmt: UpdateStmt) Error!void {
+        const b: *GeneralSQLQueryBuilder = @ptrCast(@alignCast(ctx));
+        const sql_writer = b.sql_buf.writer();
+        _ = sql_writer;
+        _ = update_stmt;
     }
 
     fn buildStmtExpr(ctx: *anyopaque, expr: StmtExpr) Error!void {
@@ -1614,23 +1802,6 @@ pub const GeneralSQLQueryBuilder = struct {
         }
     }
 
-    fn buildSelectStmt(ctx: *anyopaque, select_stmt: SelectStmt) Error!void {
-        const b: *GeneralSQLQueryBuilder = @ptrCast(@alignCast(ctx));
-        const sql_writer = b.sql_buf.writer();
-        for (select_stmt.compound_select, 0..) |cs, i| {
-            if (i != 0) {
-                try sql_writer.print(" ", .{});
-            }
-            try buildCompoundSelect(ctx, cs);
-        }
-        if (select_stmt.order_by) |order_by| {
-            _ = order_by;
-        }
-        if (select_stmt.limit) |limit| {
-            _ = limit;
-        }
-    }
-
     fn buildCompoundSelect(ctx: *anyopaque, compound_select: SelectStmt.CompoundSelect) Error!void {
         const b: *GeneralSQLQueryBuilder = @ptrCast(@alignCast(ctx));
         const sql_writer = b.sql_buf.writer();
@@ -1692,6 +1863,76 @@ pub const GeneralSQLQueryBuilder = struct {
             try buildStmtExpr(ctx, expr);
         }
         try sql_writer.print(")", .{});
+    }
+
+    fn buildUpsertClause(ctx: *anyopaque, upsert_clause: UpsertClause) Error!void {
+        const b: *GeneralSQLQueryBuilder = @ptrCast(@alignCast(ctx));
+        const sql_writer = b.sql_buf.writer();
+        try sql_writer.print("ON CONFLICT ", .{});
+        if (upsert_clause.conflict_target) |conflict_target| {
+            if (conflict_target.indexed_columns.len > 0) {
+                try sql_writer.print("(", .{});
+                for (conflict_target.indexed_columns, 0..) |indexed_column, i| {
+                    if (i != 0) {
+                        try sql_writer.print(", ", .{});
+                    }
+                    switch (indexed_column.col_or_expr) {
+                        .col => |c| try sql_writer.print("\"{s}\"", .{c}),
+                        .expr => |e| try buildStmtExpr(ctx, e),
+                    }
+                    if (indexed_column.collate) |collate| {
+                        try sql_writer.print(" COLLATE {s}", .{collate});
+                    }
+                    if (indexed_column.order) |order| {
+                        switch (order) {
+                            .asc => try sql_writer.print(" ASC", .{}),
+                            .desc => try sql_writer.print(" DESC", .{}),
+                        }
+                    }
+                }
+                try sql_writer.print(")", .{});
+            }
+            try sql_writer.print(" ", .{});
+        }
+        try sql_writer.print("DO ", .{});
+        switch (upsert_clause.update_strategy) {
+            .nothing => try sql_writer.print("NOTHING", .{}),
+            .update => |u| {
+                try sql_writer.print("UPDATE SET ", .{});
+                if (u.set_exprs.len > 0) {
+                    for (u.set_exprs, 0..) |set_expr, i| {
+                        if (i != 0) {
+                            try sql_writer.print(", ", .{});
+                        }
+                        try buildSetExpr(ctx, set_expr);
+                    }
+                }
+                if (u.where) |w| {
+                    try sql_writer.print(" WHERE ", .{});
+                    try buildStmtExpr(ctx, w);
+                }
+            },
+        }
+    }
+
+    fn buildReturningClause(ctx: *anyopaque, returning_clause: ReturningClause) Error!void {
+        const b: *GeneralSQLQueryBuilder = @ptrCast(@alignCast(ctx));
+        const sql_writer = b.sql_buf.writer();
+        try sql_writer.print("RETURNING ", .{});
+        for (returning_clause.items, 0..) |item, i| {
+            if (i != 0) {
+                try sql_writer.print(", ", .{});
+            }
+            switch (item) {
+                .star => try sql_writer.print("*", .{}),
+                .expr_as => |ea| {
+                    try buildStmtExpr(ctx, ea.expr);
+                    if (ea.as) |as| {
+                        try sql_writer.print(" AS '{s}'", .{as});
+                    }
+                },
+            }
+        }
     }
 };
 
@@ -2115,7 +2356,7 @@ test "genSchema" {
         id: i64,
         name: []const u8,
         pub const indexes = .{
-            .{ [_][]const u8{"name"}, IndexOpts{ .unique = true, .sortings = &[1]IndexOpts.Sorting{.desc} } },
+            .{ [_][]const u8{"name"}, IndexOpts{ .unique = true, .orders = &[1]Order{.desc} } },
         };
     };
     const Skill = struct {
@@ -2300,7 +2541,7 @@ test "genSchema" {
             TableSchema.Index{
                 .name = "idx_Company_name",
                 .keys = &[_][]const u8{"name"},
-                .opts = IndexOpts{ .unique = true, .sortings = &[1]IndexOpts.Sorting{.desc} },
+                .opts = IndexOpts{ .unique = true, .orders = &[1]Order{.desc} },
             },
         }, company_table.indexes);
 
@@ -2646,6 +2887,179 @@ test "query_builder_expr" {
         const expr = expected_expr_list[i][1];
         qb.reset();
         try qb.buildStmtExpr(expr);
+        try testing.expectEqualSlices(u8, expected_str, qb.getSql());
+    }
+}
+
+test "query_builder_upsert_clause" {
+    var gsqb = GeneralSQLQueryBuilder.init(testing.allocator);
+    defer gsqb.deinit();
+    var qb = gsqb.queryBuilder();
+
+    const expected_stmt_list = .{
+        .{ "ON CONFLICT DO NOTHING", UpsertClause{ .update_strategy = .{ .nothing = {} } } },
+        .{ "ON CONFLICT DO UPDATE SET \"name\" = 'John' WHERE TRUE", UpsertClause{
+            .update_strategy = .{ .update = .{
+                .set_exprs = &[_]UpsertClause.UpdateSetExpr{
+                    UpsertClause.UpdateSetExpr{
+                        .col_names = &[_][]const u8{"name"},
+                        .expr = StmtExpr{ .literal_value = ValueType{ .TEXT = "John" } },
+                    },
+                },
+                .where = StmtExpr{ .literal_value = ValueType{ .BOOL = true } },
+            } },
+        } },
+        .{ "ON CONFLICT (\"name\") DO UPDATE SET \"name\" = 'John'", UpsertClause{
+            .conflict_target = .{
+                .indexed_columns = &[_]UpsertClause.IndexedColumn{
+                    UpsertClause.IndexedColumn{
+                        .col_or_expr = .{ .col = "name" },
+                    },
+                },
+            },
+            .update_strategy = .{ .update = .{
+                .set_exprs = &[_]UpsertClause.UpdateSetExpr{
+                    UpsertClause.UpdateSetExpr{
+                        .col_names = &[_][]const u8{"name"},
+                        .expr = StmtExpr{ .literal_value = ValueType{ .TEXT = "John" } },
+                    },
+                },
+            } },
+        } },
+    };
+
+    inline for (0..expected_stmt_list.len) |i| {
+        const expected_str = expected_stmt_list[i][0];
+        const stmt = expected_stmt_list[i][1];
+        qb.reset();
+        try qb.buildUpsertClause(stmt);
+        try testing.expectEqualSlices(u8, expected_str, qb.getSql());
+    }
+}
+
+test "query_builder_returning_clause" {
+    var gsqb = GeneralSQLQueryBuilder.init(testing.allocator);
+    defer gsqb.deinit();
+    var qb = gsqb.queryBuilder();
+
+    const expected_stmt_list = .{
+        .{ "RETURNING *", ReturningClause{
+            .items = &[_]ReturningClause.Item{
+                ReturningClause.Item{ .star = {} },
+            },
+        } },
+        .{ "RETURNING \'John\' AS \'name\'", ReturningClause{
+            .items = &[_]ReturningClause.Item{
+                ReturningClause.Item{
+                    .expr_as = .{
+                        .expr = StmtExpr{
+                            .literal_value = ValueType{ .TEXT = "John" },
+                        },
+                        .as = "name",
+                    },
+                },
+            },
+        } },
+        .{ "RETURNING \'John\' AS \'name\', *", ReturningClause{
+            .items = &[_]ReturningClause.Item{
+                ReturningClause.Item{
+                    .expr_as = .{
+                        .expr = StmtExpr{
+                            .literal_value = ValueType{ .TEXT = "John" },
+                        },
+                        .as = "name",
+                    },
+                },
+                ReturningClause.Item{ .star = {} },
+            },
+        } },
+    };
+
+    inline for (0..expected_stmt_list.len) |i| {
+        const expected_str = expected_stmt_list[i][0];
+        const stmt = expected_stmt_list[i][1];
+        qb.reset();
+        try qb.buildReturningClause(stmt);
+        try testing.expectEqualSlices(u8, expected_str, qb.getSql());
+    }
+}
+
+test "query_builder_insert_stmt" {
+    var gsqb = GeneralSQLQueryBuilder.init(testing.allocator);
+    defer gsqb.deinit();
+    var qb = gsqb.queryBuilder();
+
+    const expected_stmt_list = .{
+        .{ "INSERT INTO \"User\" VALUES ( 1, 'John', TRUE )", InsertStmt{
+            .verb = .insert,
+            .qualified_table_name = .{ .table_or_alias_name = "User" },
+            .col_names = &[0]QualifiedColName{},
+            .payload = .{
+                .values = &[_]StmtExpr{
+                    StmtExpr{ .literal_value = ValueType{ .INT64 = 1 } },
+                    StmtExpr{ .literal_value = ValueType{ .TEXT = "John" } },
+                    StmtExpr{ .literal_value = ValueType{ .BOOL = true } },
+                },
+            },
+        } },
+        .{ "REPLACE INTO \"User\" VALUES ( 1, 'John', TRUE )", InsertStmt{
+            .verb = .replace,
+            .qualified_table_name = .{ .table_or_alias_name = "User" },
+            .col_names = &[0]QualifiedColName{},
+            .payload = .{
+                .values = &[_]StmtExpr{
+                    StmtExpr{ .literal_value = ValueType{ .INT64 = 1 } },
+                    StmtExpr{ .literal_value = ValueType{ .TEXT = "John" } },
+                    StmtExpr{ .literal_value = ValueType{ .BOOL = true } },
+                },
+            },
+        } },
+        .{ "INSERT INTO \"User\" VALUES ( 1, 'John', TRUE ) ON CONFLICT DO UPDATE SET \"name\" = 'John'", InsertStmt{
+            .verb = .insert,
+            .qualified_table_name = .{ .table_or_alias_name = "User" },
+            .col_names = &[0]QualifiedColName{},
+            .payload = .{
+                .values = &[_]StmtExpr{
+                    StmtExpr{ .literal_value = ValueType{ .INT64 = 1 } },
+                    StmtExpr{ .literal_value = ValueType{ .TEXT = "John" } },
+                    StmtExpr{ .literal_value = ValueType{ .BOOL = true } },
+                },
+            },
+            .upsert_clauses = &[_]UpsertClause{UpsertClause{
+                .update_strategy = .{ .update = .{
+                    .set_exprs = &[_]UpsertClause.UpdateSetExpr{
+                        UpsertClause.UpdateSetExpr{
+                            .col_names = &[_][]const u8{"name"},
+                            .expr = StmtExpr{ .literal_value = ValueType{ .TEXT = "John" } },
+                        },
+                    },
+                } },
+            }},
+        } },
+        .{ "INSERT INTO \"User\" VALUES ( 1, 'John', TRUE ) RETURNING *", InsertStmt{
+            .verb = .insert,
+            .qualified_table_name = .{ .table_or_alias_name = "User" },
+            .col_names = &[0]QualifiedColName{},
+            .payload = .{
+                .values = &[_]StmtExpr{
+                    StmtExpr{ .literal_value = ValueType{ .INT64 = 1 } },
+                    StmtExpr{ .literal_value = ValueType{ .TEXT = "John" } },
+                    StmtExpr{ .literal_value = ValueType{ .BOOL = true } },
+                },
+            },
+            .returning_clause = ReturningClause{
+                .items = &[_]ReturningClause.Item{
+                    ReturningClause.Item{ .star = {} },
+                },
+            },
+        } },
+    };
+
+    inline for (0..expected_stmt_list.len) |i| {
+        const expected_str = expected_stmt_list[i][0];
+        const stmt = expected_stmt_list[i][1];
+        qb.reset();
+        try qb.buildInsertStmt(stmt);
         try testing.expectEqualSlices(u8, expected_str, qb.getSql());
     }
 }

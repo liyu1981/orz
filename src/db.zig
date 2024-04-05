@@ -44,6 +44,8 @@ inline fn isArrayOf(comptime ChildType: type, comptime TestType: type) bool {
     }
 }
 
+pub const Xhs = enum { lhs, rhs };
+
 // general errors for db related fns
 
 pub const Error = error{
@@ -907,7 +909,7 @@ pub const ValueType = union(DataType) {
         @panic(@typeName(WantedType) ++ " can not be found in ValueType.");
     }
 
-    pub fn toSql(this: *const ValueType, sql_writer: std.ArrayList(u8).Writer) !void {
+    pub fn toSql(this: *const ValueType, sql_writer: std.ArrayList(u8).Writer, xhs: Xhs) !void {
         const FPrintUtil = struct {
             // morden long double requires at 21bytes to serialize, so we use 64 should be enough
             //https://en.cppreference.com/w/c/types/limits#Limits_of_floating_point_types
@@ -965,7 +967,12 @@ pub const ValueType = union(DataType) {
                     try sql_writer.print("{d}", .{f64v.v});
                 }
             },
-            .TEXT => |tv| try sql_writer.print("'{s}'", .{tv}),
+            .TEXT => |tv| {
+                switch (xhs) {
+                    .lhs => try sql_writer.print("\"{s}\"", .{tv}),
+                    .rhs => try sql_writer.print("'{s}'", .{tv}),
+                }
+            },
             .BLOB => {
                 @panic("TODO blob toString");
             },
@@ -1203,18 +1210,52 @@ pub const QualifiedTableName = struct {
     table_or_alias_name: []const u8,
 };
 
+pub const QualifiedTableNameWithAlias = struct {
+    qualified_table_name: QualifiedTableName,
+    alias: ?[]const u8 = null,
+};
+
 pub const QualifiedColName = struct {
     table_name: ?QualifiedTableName = null,
     col_name: []const u8,
 };
 
 pub const UnaryStmtExpr = struct {
-    op: enum { minus, plus },
+    op: enum {
+        minus,
+        plus,
+        bitwise_complement,
+        not,
+    },
     sub_expr: *const StmtExpr,
 };
 
 pub const BinaryStmtExpr = struct {
-    op: enum { plus, minus, multiply, divide, mod, eq, not_eq, like, not_like, is_distinct_from, is_not_distinct_from },
+    op: enum {
+        multiply,
+        divide,
+        mod,
+        plus,
+        minus,
+        bitwise_and,
+        bitwise_or,
+        shift_left,
+        shift_right,
+        less_than,
+        greater_than,
+        less_eq_than,
+        greater_eq_than,
+        eq,
+        not_eq,
+        is,
+        is_not,
+        is_distinct_from,
+        is_not_distinct_from,
+        like,
+        not_like,
+        and_,
+        or_,
+    },
     sub_expr_left: *const StmtExpr,
     sub_expr_right: *const StmtExpr,
 };
@@ -1267,22 +1308,20 @@ pub const StmtExpr = union(enum) {
 
 pub const FunctionCallClause = struct {
     schema_name: ?[]const u8 = null,
-    func_name: []const u8,
+    function_name: []const u8,
     exprs: []const StmtExpr,
 };
 
-pub const TableOrSubQuery = union(enum) {
+pub const TableOrSubQueryClause = union(enum) {
     pub const Table = struct {
-        schema_name: ?[]const u8 = null,
-        name: []const u8,
-        as: ?[]const u8 = null,
-        index: ?union(enum) {
+        qualified_table_name_with_alias: QualifiedTableNameWithAlias,
+        index_option: ?union(enum) {
             indexed_by: []const u8,
             not_indexed: void,
         } = null,
     };
-    pub const TableFuncValue = struct {
-        func_call: FunctionCallClause,
+    pub const TableFunctionCallAs = struct {
+        function_call: FunctionCallClause,
         as: ?[]const u8 = null,
     };
     pub const SelectAs = struct {
@@ -1291,39 +1330,42 @@ pub const TableOrSubQuery = union(enum) {
     };
 
     table: Table,
-    table_func_value: TableFuncValue,
+    table_function_call_as: TableFunctionCallAs,
     sub_select: SelectAs,
     join_clause: JoinClause,
-    table_or_sub_queries: []const TableOrSubQuery,
+    table_or_sub_queries: []const TableOrSubQueryClause,
 };
 
 pub const JoinClause = struct {
     pub const JoinOperator = union(enum) {
         in_or_out: struct {
             natural: bool = false,
-            t: union(enum) {
-                outer: enum { left, right, full },
+            t: ?union(enum) {
+                outer: struct {
+                    outer_type: enum { left, right, full },
+                    outer_keyword: bool = false,
+                },
                 inner: void,
-            },
+            } = null,
         },
         cross: void,
     };
     pub const JoinConstraint = union(enum) {
         on: *const StmtExpr,
-        using: []QualifiedColName,
+        using: []const QualifiedColName,
     };
     pub const NextJoin = struct {
-        join_op: JoinOperator,
-        table_or_sub_query: *const TableOrSubQuery,
-        join_constraint: JoinConstraint,
+        join_op: ?JoinOperator = null,
+        table_or_sub_query: *const TableOrSubQueryClause,
+        join_constraint: ?JoinConstraint = null,
     };
 
-    table_or_sub_query: *const TableOrSubQuery,
-    next_join: []const NextJoin,
+    table_or_sub_query: *const TableOrSubQueryClause,
+    next_joins: []const NextJoin = &[0]JoinClause.NextJoin{},
 };
 
 pub const FromClause = union(enum) {
-    table_or_sub_query: TableOrSubQuery,
+    table_or_sub_queries: []const TableOrSubQueryClause,
     join_clause: JoinClause,
 };
 
@@ -1348,30 +1390,36 @@ pub const SelectCoreClause = struct {
 };
 
 pub const LimitClause = struct {
-    expr: *const StmtExpr,
-    offset: ?*const StmtExpr,
+    expr: StmtExpr,
+    offset: ?StmtExpr = null,
 };
 
 pub const OrderByClause = struct {
-    expr: *const StmtExpr,
+    expr: StmtExpr,
     collate: ?[]const u8 = null,
     order: ?Order = null,
-    nulls_handling: enum { first, last },
+    nulls_handling: ?enum { first, last } = null,
+};
+
+pub const CompoundSelect = struct {
+    select_core: SelectCoreClause,
+    compound: ?enum {
+        union_,
+        union_all,
+        intersect,
+        except,
+    } = null,
 };
 
 pub const SelectStmt = struct {
-    pub const CompoundSelect = struct {
-        select_core: SelectCoreClause,
-        compound: ?enum {
-            union_,
-            union_all,
-            intersect,
-            except,
-        } = null,
-    };
     compound_select: []const CompoundSelect,
     order_by: ?OrderByClause = null,
     limit: ?LimitClause = null,
+};
+
+pub const SetExprClause = struct {
+    col_names: []const QualifiedColName,
+    expr: StmtExpr,
 };
 
 pub const UpsertClause = struct {
@@ -1387,12 +1435,8 @@ pub const UpsertClause = struct {
         indexed_columns: []const IndexedColumn,
         where: ?StmtExpr = null,
     };
-    pub const UpdateSetExpr = struct {
-        col_names: []const []const u8,
-        expr: StmtExpr,
-    };
     pub const UpdateSet = struct {
-        set_exprs: []const UpdateSetExpr,
+        set_exprs: []const SetExprClause,
         where: ?StmtExpr = null,
     };
     pub const UpdateStrategy = union(enum) {
@@ -1425,28 +1469,20 @@ pub const InsertStmt = struct {
 
     verb: enum { replace, insert },
     conflict_handling: ?Constraint.ConflictHandling = null,
-    qualified_table_name: QualifiedTableName,
-    alias: ?[]const u8 = null,
-    col_names: []QualifiedColName,
+    qualified_table_name_with_alias: QualifiedTableNameWithAlias,
+    col_names: []const QualifiedColName,
     payload: Payload,
     upsert_clauses: []const UpsertClause = &[0]UpsertClause{},
     returning_clause: ?ReturningClause = null,
 };
 
 pub const UpdateStmt = struct {
-    pub const From = union(enum) {
-        table: []const u8,
-        sub_select: SelectStmt,
-    };
-
-    conflict_handling: Constraint.ConflictHandling,
-    schema_name: ?[]const u8 = null,
-    table_name: []const u8,
-    alias: ?[]const u8 = null,
-    col_name: []const u8,
-    value: ValueType,
-    from: ?From = null,
-    where: ?[]const []const u8 = null,
+    conflict_handling: ?Constraint.ConflictHandling = null,
+    qualified_table_name_with_alias: QualifiedTableNameWithAlias,
+    set_values: []const SetExprClause,
+    from: ?FromClause = null,
+    where: ?StmtExpr = null,
+    returning_clause: ?ReturningClause = null,
 };
 
 pub const Stmt = union(enum) {
@@ -1464,10 +1500,17 @@ pub const QueryBuilder = struct {
         implBuildSelectStmt: *const fn (ctx: *anyopaque, select_stmt: SelectStmt) Error!void,
         implBuildInsertStmt: *const fn (ctx: *anyopaque, insert_stmt: InsertStmt) Error!void,
         implBuildUpdateStmt: *const fn (ctx: *anyopaque, update_stmt: UpdateStmt) Error!void,
-        implBuildStmtExpr: *const fn (ctx: *anyopaque, expr: StmtExpr) Error!void,
+        implBuildStmtExpr: *const fn (ctx: *anyopaque, expr: StmtExpr, xhs: Xhs) Error!void,
+        implBuildCompoundSelect: *const fn (ctx: *anyopaque, compound_select: CompoundSelect) Error!void,
+        implBuildSelectCore: *const fn (ctx: *anyopaque, select_core: SelectCoreClause) Error!void,
         implBuildFunctionCall: *const fn (ctx: *anyopaque, func_call: FunctionCallClause) Error!void,
         implBuildUpsertClause: *const fn (ctx: *anyopaque, upsert_clause: UpsertClause) Error!void,
         implBuildReturningClause: *const fn (ctx: *anyopaque, returning_clause: ReturningClause) Error!void,
+        implBuildTableOrSubQueryClause: *const fn (ctx: *anyopaque, table_or_subquery_clause: TableOrSubQueryClause) Error!void,
+        implBuildJoinClause: *const fn (ctx: *anyopaque, join_clause: JoinClause) Error!void,
+        implBuildFromClause: *const fn (ctx: *anyopaque, from_clause: FromClause) Error!void,
+        implBuildOrderByClause: *const fn (ctx: *anyopaque, order_by: OrderByClause) Error!void,
+        implBuildLimitClause: *const fn (ctx: *anyopaque, limit: LimitClause) Error!void,
     };
 
     ctx: *anyopaque,
@@ -1506,8 +1549,16 @@ pub const QueryBuilder = struct {
         try this.vtable.implBuildUpdateStmt(this.ctx, update_stmt);
     }
 
-    pub inline fn buildStmtExpr(this: *QueryBuilder, expr: StmtExpr) Error!void {
-        try this.vtable.implBuildStmtExpr(this.ctx, expr);
+    pub inline fn buildStmtExpr(this: *QueryBuilder, expr: StmtExpr, xhs: Xhs) Error!void {
+        try this.vtable.implBuildStmtExpr(this.ctx, expr, xhs);
+    }
+
+    pub inline fn buildCompoundSelect(this: *QueryBuilder, compound_select: SelectStmt.CompoundSelect) Error!void {
+        try this.vtable.implBuildCompoundSelect(this.ctx, compound_select);
+    }
+
+    pub inline fn buildSelectCore(this: *QueryBuilder, select_core: SelectCoreClause) Error!void {
+        try this.vtable.implBuildSelectCore(this.ctx, select_core);
     }
 
     pub inline fn buildFunctionCall(this: *QueryBuilder, func_call: FunctionCallClause) Error!void {
@@ -1520,6 +1571,26 @@ pub const QueryBuilder = struct {
 
     pub inline fn buildReturningClause(this: *QueryBuilder, returning_clause: ReturningClause) Error!void {
         try this.vtable.implBuildReturningClause(this.ctx, returning_clause);
+    }
+
+    pub inline fn buildTableOrSubQueryClause(this: *QueryBuilder, table_or_subquery_clause: TableOrSubQueryClause) Error!void {
+        try this.vtable.implBuildTableOrSubQueryClause(this.ctx, table_or_subquery_clause);
+    }
+
+    pub inline fn buildJoinClause(this: *QueryBuilder, join_clause: JoinClause) Error!void {
+        try this.vtable.implBuildJoinClause(this.ctx, join_clause);
+    }
+
+    pub inline fn buildFromClause(this: *QueryBuilder, from_clause: FromClause) Error!void {
+        try this.vtable.implBuildFromClause(this.ctx, from_clause);
+    }
+
+    pub inline fn buildOrderByClause(this: *QueryBuilder, order_by: OrderByClause) Error!void {
+        try this.vtable.implBuildOrderByClause(this.ctx, order_by);
+    }
+
+    pub inline fn buildLimitClause(this: *QueryBuilder, limit: LimitClause) Error!void {
+        try this.vtable.implBuildLimitClause(this.ctx, limit);
     }
 };
 
@@ -1540,9 +1611,16 @@ pub const GeneralSQLQueryBuilder = struct {
                 .implBuildInsertStmt = buildInsertStmt,
                 .implBuildUpdateStmt = buildUpdateStmt,
                 .implBuildStmtExpr = buildStmtExpr,
+                .implBuildCompoundSelect = buildCompoundSelect,
+                .implBuildSelectCore = buildSelectCore,
                 .implBuildFunctionCall = buildFunctionCall,
                 .implBuildUpsertClause = buildUpsertClause,
                 .implBuildReturningClause = buildReturningClause,
+                .implBuildTableOrSubQueryClause = buildTableOrSubQueryClause,
+                .implBuildJoinClause = buildJoinClause,
+                .implBuildFromClause = buildFromClause,
+                .implBuildOrderByClause = buildOrderByClause,
+                .implBuildLimitClause = buildLimitClause,
             },
         };
     }
@@ -1573,7 +1651,7 @@ pub const GeneralSQLQueryBuilder = struct {
         try sql_writer.print("\"{s}\"", .{col_name.col_name});
     }
 
-    pub fn buildSetExpr(ctx: *anyopaque, set_expr: UpsertClause.UpdateSetExpr) Error!void {
+    pub fn buildSetExprClause(ctx: *anyopaque, set_expr: SetExprClause) Error!void {
         const b: *GeneralSQLQueryBuilder = @ptrCast(@alignCast(ctx));
         const sql_writer = b.sql_buf.writer();
         if (set_expr.col_names.len > 0) {
@@ -1584,14 +1662,35 @@ pub const GeneralSQLQueryBuilder = struct {
                 if (i != 0) {
                     try sql_writer.print(", ", .{});
                 }
-                try sql_writer.print("\"{s}\"", .{col_name});
+                try buildQualifiedColName(sql_writer, col_name);
             }
             if (set_expr.col_names.len > 1) {
                 try sql_writer.print(")", .{});
             }
         }
         try sql_writer.print(" = ", .{});
-        try buildStmtExpr(ctx, set_expr.expr);
+        try buildStmtExpr(ctx, set_expr.expr, .rhs);
+    }
+
+    pub fn buildConflictHandling(sql_writer: std.ArrayList(u8).Writer, ch: Constraint.ConflictHandling) Error!void {
+        switch (ch) {
+            .abort => try sql_writer.print("OR ABORT ", .{}),
+            .fail => try sql_writer.print("OR FAIL ", .{}),
+            .ignore => try sql_writer.print("OR IGNORE ", .{}),
+            .replace => try sql_writer.print("OR REPLACE ", .{}),
+            .rollback => try sql_writer.print("OR ROLLBACK ", .{}),
+        }
+    }
+
+    pub fn buildCollate(sql_writer: std.ArrayList(u8).Writer, collate: []const u8) Error!void {
+        try sql_writer.print("COLLATE {s}", .{collate});
+    }
+
+    pub fn buildOrder(sql_writer: std.ArrayList(u8).Writer, order: Order) Error!void {
+        switch (order) {
+            .asc => try sql_writer.print("ASC", .{}),
+            .desc => try sql_writer.print("DESC", .{}),
+        }
     }
 
     // vtable fns
@@ -1621,10 +1720,12 @@ pub const GeneralSQLQueryBuilder = struct {
             try buildCompoundSelect(ctx, cs);
         }
         if (select_stmt.order_by) |order_by| {
-            _ = order_by;
+            try sql_writer.print(" ", .{});
+            try buildOrderByClause(ctx, order_by);
         }
         if (select_stmt.limit) |limit| {
-            _ = limit;
+            try sql_writer.print(" ", .{});
+            try buildLimitClause(ctx, limit);
         }
     }
 
@@ -1637,20 +1738,14 @@ pub const GeneralSQLQueryBuilder = struct {
             .insert => {
                 try sql_writer.print("INSERT ", .{});
                 if (insert_stmt.conflict_handling) |ch| {
-                    switch (ch) {
-                        .abort => try sql_writer.print("OR ABORT ", .{}),
-                        .fail => try sql_writer.print("OR FAIL ", .{}),
-                        .ignore => try sql_writer.print("OR IGNORE ", .{}),
-                        .replace => try sql_writer.print("OR REPLACE ", .{}),
-                        .rollback => try sql_writer.print("OR ROLLBACK ", .{}),
-                    }
+                    try buildConflictHandling(sql_writer, ch);
                 }
                 try sql_writer.print("INTO ", .{});
             },
         }
 
-        try buildQualifiedTableName(sql_writer, insert_stmt.qualified_table_name);
-        if (insert_stmt.alias) |a| {
+        try buildQualifiedTableName(sql_writer, insert_stmt.qualified_table_name_with_alias.qualified_table_name);
+        if (insert_stmt.qualified_table_name_with_alias.alias) |a| {
             try sql_writer.print(" AS {s} ", .{a});
         }
 
@@ -1672,7 +1767,7 @@ pub const GeneralSQLQueryBuilder = struct {
                     if (i != 0) {
                         try sql_writer.print(", ", .{});
                     }
-                    try buildStmtExpr(ctx, v);
+                    try buildStmtExpr(ctx, v, .rhs);
                 }
                 try sql_writer.print(" )", .{});
             },
@@ -1701,15 +1796,40 @@ pub const GeneralSQLQueryBuilder = struct {
     fn buildUpdateStmt(ctx: *anyopaque, update_stmt: UpdateStmt) Error!void {
         const b: *GeneralSQLQueryBuilder = @ptrCast(@alignCast(ctx));
         const sql_writer = b.sql_buf.writer();
-        _ = sql_writer;
-        _ = update_stmt;
+        try sql_writer.print("UPDATE ", .{});
+        if (update_stmt.conflict_handling) |ch| {
+            try buildConflictHandling(sql_writer, ch);
+        }
+        try buildQualifiedTableName(sql_writer, update_stmt.qualified_table_name_with_alias.qualified_table_name);
+        if (update_stmt.qualified_table_name_with_alias.alias) |a| {
+            try sql_writer.print(" AS '{s}'", .{a});
+        }
+        try sql_writer.print(" SET ", .{});
+        for (update_stmt.set_values, 0..) |sv, i| {
+            if (i != 0) {
+                try sql_writer.print(", ", .{});
+            }
+            try buildSetExprClause(ctx, sv);
+        }
+        if (update_stmt.from) |from| {
+            try sql_writer.print(" ", .{});
+            _ = from;
+        }
+        if (update_stmt.where) |where| {
+            try sql_writer.print(" WHERE ", .{});
+            try buildStmtExpr(ctx, where, .rhs);
+        }
+        if (update_stmt.returning_clause) |rc| {
+            try sql_writer.print(" ", .{});
+            try buildReturningClause(ctx, rc);
+        }
     }
 
-    fn buildStmtExpr(ctx: *anyopaque, expr: StmtExpr) Error!void {
+    fn buildStmtExpr(ctx: *anyopaque, expr: StmtExpr, xhs: Xhs) Error!void {
         const b: *GeneralSQLQueryBuilder = @ptrCast(@alignCast(ctx));
         const sql_writer = b.sql_buf.writer();
         switch (expr) {
-            .literal_value => |lv| try lv.toSql(sql_writer),
+            .literal_value => |lv| try lv.toSql(sql_writer, xhs),
 
             .qualified_col => |qc| try buildQualifiedColName(sql_writer, qc),
 
@@ -1717,30 +1837,44 @@ pub const GeneralSQLQueryBuilder = struct {
                 switch (ue.op) {
                     .minus => try sql_writer.print("- ", .{}),
                     .plus => try sql_writer.print("+ ", .{}),
+                    .bitwise_complement => try sql_writer.print("~ ", .{}),
+                    .not => try sql_writer.print("NOT ", .{}),
                 }
-                try buildStmtExpr(ctx, ue.sub_expr.*);
+                try buildStmtExpr(ctx, ue.sub_expr.*, .rhs);
             },
 
             .binary_expr => |be| {
-                try buildStmtExpr(ctx, be.sub_expr_left.*);
+                try buildStmtExpr(ctx, be.sub_expr_left.*, .lhs);
                 switch (be.op) {
-                    .plus => try sql_writer.print(" + ", .{}),
-                    .minus => try sql_writer.print(" - ", .{}),
                     .multiply => try sql_writer.print(" * ", .{}),
                     .divide => try sql_writer.print(" / ", .{}),
                     .mod => try sql_writer.print(" % ", .{}),
+                    .plus => try sql_writer.print(" + ", .{}),
+                    .minus => try sql_writer.print(" - ", .{}),
+                    .bitwise_and => try sql_writer.print(" & ", .{}),
+                    .bitwise_or => try sql_writer.print(" | ", .{}),
+                    .shift_left => try sql_writer.print(" << ", .{}),
+                    .shift_right => try sql_writer.print(" >> ", .{}),
+                    .less_than => try sql_writer.print(" < ", .{}),
+                    .greater_than => try sql_writer.print(" > ", .{}),
+                    .less_eq_than => try sql_writer.print(" <= ", .{}),
+                    .greater_eq_than => try sql_writer.print(" >= ", .{}),
                     .eq => try sql_writer.print(" = ", .{}),
                     .not_eq => try sql_writer.print(" != ", .{}),
-                    .like => try sql_writer.print(" LIKE ", .{}),
-                    .not_like => try sql_writer.print(" NOT LIKE ", .{}),
+                    .is => try sql_writer.print(" IS ", .{}),
+                    .is_not => try sql_writer.print(" IS NOT ", .{}),
                     .is_distinct_from => try sql_writer.print(" IS DISTINCT FROM ", .{}),
                     .is_not_distinct_from => try sql_writer.print(" IS NOT DISTINCT FROM ", .{}),
+                    .like => try sql_writer.print(" LIKE ", .{}),
+                    .not_like => try sql_writer.print(" NOT LIKE ", .{}),
+                    .and_ => try sql_writer.print(" AND ", .{}),
+                    .or_ => try sql_writer.print(" OR ", .{}),
                 }
-                try buildStmtExpr(ctx, be.sub_expr_right.*);
+                try buildStmtExpr(ctx, be.sub_expr_right.*, .rhs);
             },
 
             .suffix_expr => |se| {
-                try buildStmtExpr(ctx, se.sub_expr.*);
+                try buildStmtExpr(ctx, se.sub_expr.*, .lhs);
                 switch (se.op) {
                     .isnull => try sql_writer.print(" IS NULL", .{}),
                     .notnull => try sql_writer.print(" IS NOT NULL", .{}),
@@ -1757,19 +1891,19 @@ pub const GeneralSQLQueryBuilder = struct {
             },
 
             .cast_expr => |ce| {
-                try buildStmtExpr(ctx, ce.sub_expr.*);
+                try buildStmtExpr(ctx, ce.sub_expr.*, .lhs);
                 try sql_writer.print(" AS {s}", .{getLocalType(ctx, ce.as_type)});
             },
 
             .between_expr => |be| {
-                try buildStmtExpr(ctx, be.target_expr.*);
+                try buildStmtExpr(ctx, be.target_expr.*, .lhs);
                 switch (be.op) {
                     .between => try sql_writer.print(" BETWEEN ", .{}),
                     .not_between => try sql_writer.print(" NOT BETWEEN ", .{}),
                 }
-                try buildStmtExpr(ctx, be.range_start_expr.*);
+                try buildStmtExpr(ctx, be.range_start_expr.*, .rhs);
                 try sql_writer.print(" AND ", .{});
-                try buildStmtExpr(ctx, be.range_end_expr.*);
+                try buildStmtExpr(ctx, be.range_end_expr.*, .rhs);
             },
 
             .in_expr => |ie| {
@@ -1790,7 +1924,7 @@ pub const GeneralSQLQueryBuilder = struct {
                             if (i != 0) {
                                 try sql_writer.print(", ", .{});
                             }
-                            try buildStmtExpr(ctx, e);
+                            try buildStmtExpr(ctx, e, .rhs);
                         }
                         try sql_writer.print(" )", .{});
                     },
@@ -1802,7 +1936,7 @@ pub const GeneralSQLQueryBuilder = struct {
         }
     }
 
-    fn buildCompoundSelect(ctx: *anyopaque, compound_select: SelectStmt.CompoundSelect) Error!void {
+    fn buildCompoundSelect(ctx: *anyopaque, compound_select: CompoundSelect) Error!void {
         const b: *GeneralSQLQueryBuilder = @ptrCast(@alignCast(ctx));
         const sql_writer = b.sql_buf.writer();
         try buildSelectCore(ctx, compound_select.select_core);
@@ -1826,7 +1960,7 @@ pub const GeneralSQLQueryBuilder = struct {
         for (select_core.result_cols) |result_col| {
             switch (result_col) {
                 .expr => |e| {
-                    try buildStmtExpr(ctx, e.expr.*);
+                    try buildStmtExpr(ctx, e.expr.*, .lhs);
                     if (e.as) |a| {
                         try sql_writer.print(" AS '{s}'", .{a});
                     }
@@ -1836,31 +1970,40 @@ pub const GeneralSQLQueryBuilder = struct {
             }
         }
         if (select_core.from) |from| {
-            _ = from;
+            try sql_writer.print(" ", .{});
+            try buildFromClause(ctx, from);
         }
         if (select_core.where) |where| {
-            _ = where;
+            try sql_writer.print(" WHERE ", .{});
+            try buildStmtExpr(ctx, where.*, .rhs);
         }
         if (select_core.group_by) |group_by| {
-            _ = group_by;
+            try sql_writer.print(" GROUP BY ", .{});
+            for (group_by, 0..) |by, i| {
+                if (i != 0) {
+                    try sql_writer.print(", ", .{});
+                }
+                try buildStmtExpr(ctx, by, .lhs);
+            }
         }
         if (select_core.having) |having| {
-            _ = having;
+            try sql_writer.print(" HAVING ", .{});
+            try buildStmtExpr(ctx, having.*, .rhs);
         }
     }
 
-    fn buildFunctionCall(ctx: *anyopaque, func_call: FunctionCallClause) Error!void {
+    fn buildFunctionCall(ctx: *anyopaque, fc: FunctionCallClause) Error!void {
         const b: *GeneralSQLQueryBuilder = @ptrCast(@alignCast(ctx));
         const sql_writer = b.sql_buf.writer();
-        if (func_call.schema_name) |schema_name| {
+        if (fc.schema_name) |schema_name| {
             try sql_writer.print("{s}.", .{schema_name});
         }
-        try sql_writer.print("{s}(", .{func_call.func_name});
-        for (func_call.exprs, 0..) |expr, i| {
+        try sql_writer.print("{s}(", .{fc.function_name});
+        for (fc.exprs, 0..) |expr, i| {
             if (i != 0) {
                 try sql_writer.print(", ", .{});
             }
-            try buildStmtExpr(ctx, expr);
+            try buildStmtExpr(ctx, expr, .rhs);
         }
         try sql_writer.print(")", .{});
     }
@@ -1878,16 +2021,15 @@ pub const GeneralSQLQueryBuilder = struct {
                     }
                     switch (indexed_column.col_or_expr) {
                         .col => |c| try sql_writer.print("\"{s}\"", .{c}),
-                        .expr => |e| try buildStmtExpr(ctx, e),
+                        .expr => |e| try buildStmtExpr(ctx, e, .rhs),
                     }
                     if (indexed_column.collate) |collate| {
-                        try sql_writer.print(" COLLATE {s}", .{collate});
+                        try sql_writer.print(" ", .{});
+                        try buildCollate(sql_writer, collate);
                     }
                     if (indexed_column.order) |order| {
-                        switch (order) {
-                            .asc => try sql_writer.print(" ASC", .{}),
-                            .desc => try sql_writer.print(" DESC", .{}),
-                        }
+                        try sql_writer.print(" ", .{});
+                        try buildOrder(sql_writer, order);
                     }
                 }
                 try sql_writer.print(")", .{});
@@ -1904,12 +2046,12 @@ pub const GeneralSQLQueryBuilder = struct {
                         if (i != 0) {
                             try sql_writer.print(", ", .{});
                         }
-                        try buildSetExpr(ctx, set_expr);
+                        try buildSetExprClause(ctx, set_expr);
                     }
                 }
                 if (u.where) |w| {
                     try sql_writer.print(" WHERE ", .{});
-                    try buildStmtExpr(ctx, w);
+                    try buildStmtExpr(ctx, w, .rhs);
                 }
             },
         }
@@ -1926,12 +2068,169 @@ pub const GeneralSQLQueryBuilder = struct {
             switch (item) {
                 .star => try sql_writer.print("*", .{}),
                 .expr_as => |ea| {
-                    try buildStmtExpr(ctx, ea.expr);
+                    try buildStmtExpr(ctx, ea.expr, .rhs);
                     if (ea.as) |as| {
                         try sql_writer.print(" AS '{s}'", .{as});
                     }
                 },
             }
+        }
+    }
+
+    fn buildTableOrSubQueryClause(ctx: *anyopaque, table_or_subquery_clause: TableOrSubQueryClause) Error!void {
+        const b: *GeneralSQLQueryBuilder = @ptrCast(@alignCast(ctx));
+        const sql_writer = b.sql_buf.writer();
+        switch (table_or_subquery_clause) {
+            .table => |t| {
+                try buildQualifiedTableName(sql_writer, t.qualified_table_name_with_alias.qualified_table_name);
+                if (t.qualified_table_name_with_alias.alias) |a| {
+                    try sql_writer.print(" AS '{s}'", .{a});
+                }
+                if (t.index_option) |index_option| {
+                    switch (index_option) {
+                        .indexed_by => |ib| try sql_writer.print(" INDEXED BY \"{s}\"", .{ib}),
+                        .not_indexed => try sql_writer.print(" NOT INDEXED", .{}),
+                    }
+                }
+            },
+            .table_function_call_as => |tfca| {
+                try buildFunctionCall(ctx, tfca.function_call);
+                if (tfca.as) |a| {
+                    try sql_writer.print(" AS '{s}'", .{a});
+                }
+            },
+            .sub_select => |ss| {
+                try sql_writer.print("( ", .{});
+                try buildSelectStmt(ctx, ss.sub_select.*);
+                try sql_writer.print(" )", .{});
+                if (ss.as) |a| {
+                    try sql_writer.print(" AS '{s}'", .{a});
+                }
+            },
+            .join_clause => |jc| {
+                try sql_writer.print("( ", .{});
+                try buildJoinClause(ctx, jc);
+                try sql_writer.print(" )", .{});
+            },
+            .table_or_sub_queries => |ts_arr| {
+                try sql_writer.print("( ", .{});
+                for (ts_arr, 0..) |tsq, i| {
+                    if (i != 0) {
+                        try sql_writer.print(", ", .{});
+                    }
+                    try buildTableOrSubQueryClause(ctx, tsq);
+                }
+                try sql_writer.print(" )", .{});
+            },
+        }
+    }
+
+    fn buildJoinClause(ctx: *anyopaque, join_clause: JoinClause) Error!void {
+        const b: *GeneralSQLQueryBuilder = @ptrCast(@alignCast(ctx));
+        const sql_writer = b.sql_buf.writer();
+        try buildTableOrSubQueryClause(ctx, join_clause.table_or_sub_query.*);
+        for (join_clause.next_joins) |next_join| {
+            if (next_join.join_op) |join_op| {
+                try sql_writer.print(" ", .{});
+                switch (join_op) {
+                    .in_or_out => |ioro| {
+                        if (ioro.natural) {
+                            try sql_writer.print("NATURAL ", .{});
+                        }
+                        if (ioro.t) |t| {
+                            switch (t) {
+                                .outer => |o| {
+                                    switch (o.outer_type) {
+                                        .left => try sql_writer.print("LEFT ", .{}),
+                                        .right => try sql_writer.print("RIGHT ", .{}),
+                                        .full => try sql_writer.print("FULL ", .{}),
+                                    }
+                                    if (o.outer_keyword) {
+                                        try sql_writer.print("OUTER ", .{});
+                                    }
+                                },
+                                .inner => try sql_writer.print("INNER ", .{}),
+                            }
+                        }
+                    },
+                    .cross => try sql_writer.print("CROSS ", .{}),
+                }
+                try sql_writer.print("JOIN ", .{});
+            } else {
+                try sql_writer.print(", ", .{});
+            }
+
+            try buildTableOrSubQueryClause(ctx, next_join.table_or_sub_query.*);
+
+            if (next_join.join_constraint) |join_constraint| {
+                try sql_writer.print(" ", .{});
+                switch (join_constraint) {
+                    .on => |on_expr| {
+                        try sql_writer.print("ON ", .{});
+                        try buildStmtExpr(ctx, on_expr.*, .rhs);
+                    },
+                    .using => |using_cols| {
+                        try sql_writer.print("USING (", .{});
+                        for (using_cols, 0..) |using_col, i| {
+                            if (i != 0) {
+                                try sql_writer.print(", ", .{});
+                            }
+                            try buildQualifiedColName(sql_writer, using_col);
+                        }
+                        try sql_writer.print(")", .{});
+                    },
+                }
+            }
+        }
+    }
+
+    fn buildFromClause(ctx: *anyopaque, from_clause: FromClause) Error!void {
+        const b: *GeneralSQLQueryBuilder = @ptrCast(@alignCast(ctx));
+        const sql_writer = b.sql_buf.writer();
+        try sql_writer.print("FROM ", .{});
+        switch (from_clause) {
+            .table_or_sub_queries => |tsq_arr| {
+                for (tsq_arr, 0..) |tsq, i| {
+                    if (i != 0) {
+                        try sql_writer.print(", ", .{});
+                    }
+                    try buildTableOrSubQueryClause(ctx, tsq);
+                }
+            },
+            .join_clause => |jc| try buildJoinClause(ctx, jc),
+        }
+    }
+
+    fn buildOrderByClause(ctx: *anyopaque, order_by: OrderByClause) Error!void {
+        const b: *GeneralSQLQueryBuilder = @ptrCast(@alignCast(ctx));
+        const sql_writer = b.sql_buf.writer();
+        try sql_writer.print("ORDER BY ", .{});
+        try buildStmtExpr(ctx, order_by.expr, .lhs);
+        if (order_by.collate) |collate| {
+            try sql_writer.print(" ", .{});
+            try buildCollate(sql_writer, collate);
+        }
+        if (order_by.order) |order| {
+            try sql_writer.print(" ", .{});
+            try buildOrder(sql_writer, order);
+        }
+        if (order_by.nulls_handling) |nulls_handling| {
+            try sql_writer.print(" ", .{});
+            switch (nulls_handling) {
+                .first => try sql_writer.print("NULLS FIRST", .{}),
+                .last => try sql_writer.print("NULLS LAST", .{}),
+            }
+        }
+    }
+
+    fn buildLimitClause(ctx: *anyopaque, limit: LimitClause) Error!void {
+        const b: *GeneralSQLQueryBuilder = @ptrCast(@alignCast(ctx));
+        const sql_writer = b.sql_buf.writer();
+        try sql_writer.print("LIMIT ", .{});
+        try buildStmtExpr(ctx, limit.expr, .rhs);
+        if (limit.offset) |offset_expr| {
+            try sql_writer.print(" OFFSET ", .{});
+            try buildStmtExpr(ctx, offset_expr, .rhs);
         }
     }
 };
@@ -2764,8 +3063,8 @@ test "query_builder_expr" {
             .exist_expr = .{
                 .op = .exist,
                 .select_stmt = &SelectStmt{
-                    .compound_select = &[_]SelectStmt.CompoundSelect{
-                        SelectStmt.CompoundSelect{
+                    .compound_select = &[_]CompoundSelect{
+                        CompoundSelect{
                             .select_core = .{
                                 .result_cols = &[_]SelectCoreClause.ResultCol{
                                     SelectCoreClause.ResultCol{
@@ -2784,8 +3083,8 @@ test "query_builder_expr" {
             .exist_expr = .{
                 .op = .not_exist,
                 .select_stmt = &SelectStmt{
-                    .compound_select = &[_]SelectStmt.CompoundSelect{
-                        SelectStmt.CompoundSelect{
+                    .compound_select = &[_]CompoundSelect{
+                        CompoundSelect{
                             .select_core = .{
                                 .result_cols = &[_]SelectCoreClause.ResultCol{
                                     SelectCoreClause.ResultCol{
@@ -2830,8 +3129,8 @@ test "query_builder_expr" {
                 .op = .in,
                 .set = .{
                     .sub_select = &SelectStmt{
-                        .compound_select = &[_]SelectStmt.CompoundSelect{
-                            SelectStmt.CompoundSelect{
+                        .compound_select = &[_]CompoundSelect{
+                            CompoundSelect{
                                 .select_core = .{
                                     .result_cols = &[_]SelectCoreClause.ResultCol{
                                         SelectCoreClause.ResultCol{
@@ -2872,7 +3171,7 @@ test "query_builder_expr" {
                 .op = .not_in,
                 .set = .{
                     .function_call = .{
-                        .func_name = "sqrt",
+                        .function_name = "sqrt",
                         .exprs = &[_]StmtExpr{
                             StmtExpr{ .literal_value = ValueType{ .INT64 = 4 } },
                         },
@@ -2886,7 +3185,7 @@ test "query_builder_expr" {
         const expected_str = expected_expr_list[i][0];
         const expr = expected_expr_list[i][1];
         qb.reset();
-        try qb.buildStmtExpr(expr);
+        try qb.buildStmtExpr(expr, .rhs);
         try testing.expectEqualSlices(u8, expected_str, qb.getSql());
     }
 }
@@ -2900,9 +3199,9 @@ test "query_builder_upsert_clause" {
         .{ "ON CONFLICT DO NOTHING", UpsertClause{ .update_strategy = .{ .nothing = {} } } },
         .{ "ON CONFLICT DO UPDATE SET \"name\" = 'John' WHERE TRUE", UpsertClause{
             .update_strategy = .{ .update = .{
-                .set_exprs = &[_]UpsertClause.UpdateSetExpr{
-                    UpsertClause.UpdateSetExpr{
-                        .col_names = &[_][]const u8{"name"},
+                .set_exprs = &[_]SetExprClause{
+                    SetExprClause{
+                        .col_names = &[_]QualifiedColName{QualifiedColName{ .col_name = "name" }},
                         .expr = StmtExpr{ .literal_value = ValueType{ .TEXT = "John" } },
                     },
                 },
@@ -2918,9 +3217,9 @@ test "query_builder_upsert_clause" {
                 },
             },
             .update_strategy = .{ .update = .{
-                .set_exprs = &[_]UpsertClause.UpdateSetExpr{
-                    UpsertClause.UpdateSetExpr{
-                        .col_names = &[_][]const u8{"name"},
+                .set_exprs = &[_]SetExprClause{
+                    SetExprClause{
+                        .col_names = &[_]QualifiedColName{QualifiedColName{ .col_name = "name" }},
                         .expr = StmtExpr{ .literal_value = ValueType{ .TEXT = "John" } },
                     },
                 },
@@ -2992,7 +3291,9 @@ test "query_builder_insert_stmt" {
     const expected_stmt_list = .{
         .{ "INSERT INTO \"User\" VALUES ( 1, 'John', TRUE )", InsertStmt{
             .verb = .insert,
-            .qualified_table_name = .{ .table_or_alias_name = "User" },
+            .qualified_table_name_with_alias = .{
+                .qualified_table_name = .{ .table_or_alias_name = "User" },
+            },
             .col_names = &[0]QualifiedColName{},
             .payload = .{
                 .values = &[_]StmtExpr{
@@ -3004,7 +3305,9 @@ test "query_builder_insert_stmt" {
         } },
         .{ "REPLACE INTO \"User\" VALUES ( 1, 'John', TRUE )", InsertStmt{
             .verb = .replace,
-            .qualified_table_name = .{ .table_or_alias_name = "User" },
+            .qualified_table_name_with_alias = .{
+                .qualified_table_name = .{ .table_or_alias_name = "User" },
+            },
             .col_names = &[0]QualifiedColName{},
             .payload = .{
                 .values = &[_]StmtExpr{
@@ -3016,7 +3319,9 @@ test "query_builder_insert_stmt" {
         } },
         .{ "INSERT INTO \"User\" VALUES ( 1, 'John', TRUE ) ON CONFLICT DO UPDATE SET \"name\" = 'John'", InsertStmt{
             .verb = .insert,
-            .qualified_table_name = .{ .table_or_alias_name = "User" },
+            .qualified_table_name_with_alias = .{
+                .qualified_table_name = .{ .table_or_alias_name = "User" },
+            },
             .col_names = &[0]QualifiedColName{},
             .payload = .{
                 .values = &[_]StmtExpr{
@@ -3027,9 +3332,9 @@ test "query_builder_insert_stmt" {
             },
             .upsert_clauses = &[_]UpsertClause{UpsertClause{
                 .update_strategy = .{ .update = .{
-                    .set_exprs = &[_]UpsertClause.UpdateSetExpr{
-                        UpsertClause.UpdateSetExpr{
-                            .col_names = &[_][]const u8{"name"},
+                    .set_exprs = &[_]SetExprClause{
+                        SetExprClause{
+                            .col_names = &[_]QualifiedColName{QualifiedColName{ .col_name = "name" }},
                             .expr = StmtExpr{ .literal_value = ValueType{ .TEXT = "John" } },
                         },
                     },
@@ -3038,7 +3343,9 @@ test "query_builder_insert_stmt" {
         } },
         .{ "INSERT INTO \"User\" VALUES ( 1, 'John', TRUE ) RETURNING *", InsertStmt{
             .verb = .insert,
-            .qualified_table_name = .{ .table_or_alias_name = "User" },
+            .qualified_table_name_with_alias = .{
+                .qualified_table_name = .{ .table_or_alias_name = "User" },
+            },
             .col_names = &[0]QualifiedColName{},
             .payload = .{
                 .values = &[_]StmtExpr{
@@ -3060,6 +3367,521 @@ test "query_builder_insert_stmt" {
         const stmt = expected_stmt_list[i][1];
         qb.reset();
         try qb.buildInsertStmt(stmt);
+        try testing.expectEqualSlices(u8, expected_str, qb.getSql());
+    }
+}
+
+test "query_builder_update_stmt" {
+    var gsqb = GeneralSQLQueryBuilder.init(testing.allocator);
+    defer gsqb.deinit();
+    var qb = gsqb.queryBuilder();
+
+    const expected_stmt_list = .{
+        .{ "UPDATE \"User\" SET \"name\" = 'John'", UpdateStmt{
+            .qualified_table_name_with_alias = .{ .qualified_table_name = .{ .table_or_alias_name = "User" } },
+            .set_values = &[_]SetExprClause{
+                SetExprClause{
+                    .col_names = &[_]QualifiedColName{QualifiedColName{ .col_name = "name" }},
+                    .expr = StmtExpr{ .literal_value = ValueType{ .TEXT = "John" } },
+                },
+            },
+        } },
+        .{ "UPDATE OR ROLLBACK \"User\" SET \"name\" = 'John'", UpdateStmt{
+            .conflict_handling = .rollback,
+            .qualified_table_name_with_alias = .{ .qualified_table_name = .{ .table_or_alias_name = "User" } },
+            .set_values = &[_]SetExprClause{
+                SetExprClause{
+                    .col_names = &[_]QualifiedColName{QualifiedColName{ .col_name = "name" }},
+                    .expr = StmtExpr{ .literal_value = ValueType{ .TEXT = "John" } },
+                },
+            },
+        } },
+        .{ "UPDATE OR ROLLBACK \"User\" SET \"name\" = 'John' WHERE \"id\" = 1", UpdateStmt{
+            .conflict_handling = .rollback,
+            .qualified_table_name_with_alias = .{ .qualified_table_name = .{ .table_or_alias_name = "User" } },
+            .set_values = &[_]SetExprClause{
+                SetExprClause{
+                    .col_names = &[_]QualifiedColName{QualifiedColName{ .col_name = "name" }},
+                    .expr = StmtExpr{ .literal_value = ValueType{ .TEXT = "John" } },
+                },
+            },
+            .where = StmtExpr{ .binary_expr = .{
+                .op = .eq,
+                .sub_expr_left = &StmtExpr{ .literal_value = ValueType{ .TEXT = "id" } },
+                .sub_expr_right = &StmtExpr{ .literal_value = ValueType{ .INT64 = 1 } },
+            } },
+        } },
+    };
+
+    inline for (0..expected_stmt_list.len) |i| {
+        const expected_str = expected_stmt_list[i][0];
+        const stmt = expected_stmt_list[i][1];
+        qb.reset();
+        try qb.buildUpdateStmt(stmt);
+        try testing.expectEqualSlices(u8, expected_str, qb.getSql());
+    }
+}
+
+test "query_builder_table_or_subquery" {
+    var gsqb = GeneralSQLQueryBuilder.init(testing.allocator);
+    defer gsqb.deinit();
+    var qb = gsqb.queryBuilder();
+
+    const expected_stmt_list = .{
+        .{ "\"User\" INDEXED BY \"idx_User_id\"", TableOrSubQueryClause{
+            .table = TableOrSubQueryClause.Table{
+                .qualified_table_name_with_alias = .{
+                    .qualified_table_name = .{ .table_or_alias_name = "User" },
+                },
+                .index_option = .{ .indexed_by = "idx_User_id" },
+            },
+        } },
+        .{ "sqrt(4) AS 'SqrtOf4'", TableOrSubQueryClause{
+            .table_function_call_as = TableOrSubQueryClause.TableFunctionCallAs{
+                .function_call = FunctionCallClause{
+                    .function_name = "sqrt",
+                    .exprs = &[_]StmtExpr{StmtExpr{ .literal_value = ValueType{ .INT64 = 4 } }},
+                },
+                .as = "SqrtOf4",
+            },
+        } },
+        .{ "( SELECT 1 ) AS 'tmp_user'", TableOrSubQueryClause{
+            .sub_select = .{
+                .sub_select = &SelectStmt{
+                    .compound_select = &[_]CompoundSelect{
+                        CompoundSelect{
+                            .select_core = .{
+                                .result_cols = &[_]SelectCoreClause.ResultCol{
+                                    SelectCoreClause.ResultCol{
+                                        .expr = SelectCoreClause.ResultCol.Expr{
+                                            .expr = &StmtExpr{ .literal_value = ValueType{ .INT64 = 1 } },
+                                        },
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+                .as = "tmp_user",
+            },
+        } },
+        .{ "( \"User\" INDEXED BY \"idx_User_id\", ( SELECT 1 ) AS 'tmp_user' )", TableOrSubQueryClause{
+            .table_or_sub_queries = &[_]TableOrSubQueryClause{
+                TableOrSubQueryClause{
+                    .table = TableOrSubQueryClause.Table{
+                        .qualified_table_name_with_alias = .{
+                            .qualified_table_name = .{ .table_or_alias_name = "User" },
+                        },
+                        .index_option = .{ .indexed_by = "idx_User_id" },
+                    },
+                },
+                TableOrSubQueryClause{
+                    .sub_select = .{
+                        .sub_select = &SelectStmt{
+                            .compound_select = &[_]CompoundSelect{
+                                CompoundSelect{
+                                    .select_core = .{
+                                        .result_cols = &[_]SelectCoreClause.ResultCol{
+                                            SelectCoreClause.ResultCol{
+                                                .expr = SelectCoreClause.ResultCol.Expr{
+                                                    .expr = &StmtExpr{ .literal_value = ValueType{ .INT64 = 1 } },
+                                                },
+                                            },
+                                        },
+                                    },
+                                },
+                            },
+                        },
+                        .as = "tmp_user",
+                    },
+                },
+            },
+        } },
+    };
+
+    inline for (0..expected_stmt_list.len) |i| {
+        const expected_str = expected_stmt_list[i][0];
+        const stmt = expected_stmt_list[i][1];
+        qb.reset();
+        try qb.buildTableOrSubQueryClause(stmt);
+        try testing.expectEqualSlices(u8, expected_str, qb.getSql());
+    }
+}
+
+test "query_builder_join_clause" {
+    var gsqb = GeneralSQLQueryBuilder.init(testing.allocator);
+    defer gsqb.deinit();
+    var qb = gsqb.queryBuilder();
+
+    const expected_stmt_list = .{
+        .{ "\"User\" INDEXED BY \"idx_User_id\"", JoinClause{
+            .table_or_sub_query = &TableOrSubQueryClause{
+                .table = TableOrSubQueryClause.Table{
+                    .qualified_table_name_with_alias = .{
+                        .qualified_table_name = .{ .table_or_alias_name = "User" },
+                    },
+                    .index_option = .{ .indexed_by = "idx_User_id" },
+                },
+            },
+        } },
+        .{ "\"User\", \"Company\"", JoinClause{
+            .table_or_sub_query = &TableOrSubQueryClause{
+                .table = TableOrSubQueryClause.Table{
+                    .qualified_table_name_with_alias = .{
+                        .qualified_table_name = .{ .table_or_alias_name = "User" },
+                    },
+                },
+            },
+            .next_joins = &[1]JoinClause.NextJoin{
+                JoinClause.NextJoin{ .table_or_sub_query = &TableOrSubQueryClause{
+                    .table = TableOrSubQueryClause.Table{
+                        .qualified_table_name_with_alias = .{
+                            .qualified_table_name = .{ .table_or_alias_name = "Company" },
+                        },
+                    },
+                } },
+            },
+        } },
+        .{ "\"User\" CROSS JOIN \"Company\"", JoinClause{
+            .table_or_sub_query = &TableOrSubQueryClause{
+                .table = TableOrSubQueryClause.Table{
+                    .qualified_table_name_with_alias = .{
+                        .qualified_table_name = .{ .table_or_alias_name = "User" },
+                    },
+                },
+            },
+            .next_joins = &[1]JoinClause.NextJoin{
+                JoinClause.NextJoin{
+                    .join_op = .{ .cross = {} },
+                    .table_or_sub_query = &TableOrSubQueryClause{
+                        .table = TableOrSubQueryClause.Table{
+                            .qualified_table_name_with_alias = .{
+                                .qualified_table_name = .{ .table_or_alias_name = "Company" },
+                            },
+                        },
+                    },
+                },
+            },
+        } },
+        .{ "\"User\" JOIN \"Company\"", JoinClause{
+            .table_or_sub_query = &TableOrSubQueryClause{
+                .table = TableOrSubQueryClause.Table{
+                    .qualified_table_name_with_alias = .{
+                        .qualified_table_name = .{ .table_or_alias_name = "User" },
+                    },
+                },
+            },
+            .next_joins = &[1]JoinClause.NextJoin{
+                JoinClause.NextJoin{
+                    .join_op = .{ .in_or_out = .{} },
+                    .table_or_sub_query = &TableOrSubQueryClause{
+                        .table = TableOrSubQueryClause.Table{
+                            .qualified_table_name_with_alias = .{
+                                .qualified_table_name = .{ .table_or_alias_name = "Company" },
+                            },
+                        },
+                    },
+                },
+            },
+        } },
+        .{ "\"User\" LEFT OUTER JOIN \"Company\"", JoinClause{
+            .table_or_sub_query = &TableOrSubQueryClause{
+                .table = TableOrSubQueryClause.Table{
+                    .qualified_table_name_with_alias = .{
+                        .qualified_table_name = .{ .table_or_alias_name = "User" },
+                    },
+                },
+            },
+            .next_joins = &[1]JoinClause.NextJoin{
+                JoinClause.NextJoin{
+                    .join_op = .{
+                        .in_or_out = .{
+                            .t = .{
+                                .outer = .{
+                                    .outer_type = .left,
+                                    .outer_keyword = true,
+                                },
+                            },
+                        },
+                    },
+                    .table_or_sub_query = &TableOrSubQueryClause{
+                        .table = TableOrSubQueryClause.Table{
+                            .qualified_table_name_with_alias = .{
+                                .qualified_table_name = .{ .table_or_alias_name = "Company" },
+                            },
+                        },
+                    },
+                },
+            },
+        } },
+        // TODO: need more test cases?
+    };
+
+    inline for (0..expected_stmt_list.len) |i| {
+        const expected_str = expected_stmt_list[i][0];
+        const stmt = expected_stmt_list[i][1];
+        qb.reset();
+        try qb.buildJoinClause(stmt);
+        try testing.expectEqualSlices(u8, expected_str, qb.getSql());
+    }
+}
+
+test "query_builder_select_core" {
+    var gsqb = GeneralSQLQueryBuilder.init(testing.allocator);
+    defer gsqb.deinit();
+    var qb = gsqb.queryBuilder();
+
+    const expected_stmt_list = .{
+        .{ "SELECT \"User\".* FROM \"User\" WHERE TRUE GROUP BY \"name\" HAVING \"id\" = 1", SelectCoreClause{
+            .result_cols = &[_]SelectCoreClause.ResultCol{
+                SelectCoreClause.ResultCol{ .table_star = "User" },
+            },
+            .from = FromClause{
+                .table_or_sub_queries = &[_]TableOrSubQueryClause{
+                    TableOrSubQueryClause{
+                        .table = TableOrSubQueryClause.Table{
+                            .qualified_table_name_with_alias = QualifiedTableNameWithAlias{
+                                .qualified_table_name = QualifiedTableName{ .table_or_alias_name = "User" },
+                            },
+                        },
+                    },
+                },
+            },
+            .where = &StmtExpr{ .literal_value = ValueType{ .BOOL = true } },
+            .group_by = &[_]StmtExpr{
+                StmtExpr{ .literal_value = ValueType{ .TEXT = "name" } },
+            },
+            .having = &StmtExpr{
+                .binary_expr = .{
+                    .op = .eq,
+                    .sub_expr_left = &StmtExpr{
+                        .literal_value = ValueType{ .TEXT = "id" },
+                    },
+                    .sub_expr_right = &StmtExpr{
+                        .literal_value = ValueType{ .INT64 = 1 },
+                    },
+                },
+            },
+        } },
+    };
+
+    inline for (0..expected_stmt_list.len) |i| {
+        const expected_str = expected_stmt_list[i][0];
+        const stmt = expected_stmt_list[i][1];
+        qb.reset();
+        try qb.buildSelectCore(stmt);
+        try testing.expectEqualSlices(u8, expected_str, qb.getSql());
+    }
+}
+
+test "query_builder_from_clause" {
+    var gsqb = GeneralSQLQueryBuilder.init(testing.allocator);
+    defer gsqb.deinit();
+    var qb = gsqb.queryBuilder();
+
+    const expected_stmt_list = .{
+        .{ "FROM ( SELECT 1 )", FromClause{
+            .table_or_sub_queries = &[_]TableOrSubQueryClause{
+                TableOrSubQueryClause{
+                    .sub_select = TableOrSubQueryClause.SelectAs{
+                        .sub_select = &SelectStmt{
+                            .compound_select = &[_]CompoundSelect{
+                                CompoundSelect{
+                                    .select_core = .{
+                                        .result_cols = &[_]SelectCoreClause.ResultCol{
+                                            SelectCoreClause.ResultCol{
+                                                .expr = SelectCoreClause.ResultCol.Expr{
+                                                    .expr = &StmtExpr{ .literal_value = ValueType{ .INT64 = 1 } },
+                                                },
+                                            },
+                                        },
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        } },
+        .{ "FROM \"User\" JOIN \"Company\"", FromClause{
+            .join_clause = JoinClause{
+                .table_or_sub_query = &TableOrSubQueryClause{
+                    .table = TableOrSubQueryClause.Table{
+                        .qualified_table_name_with_alias = .{
+                            .qualified_table_name = .{ .table_or_alias_name = "User" },
+                        },
+                    },
+                },
+                .next_joins = &[1]JoinClause.NextJoin{
+                    JoinClause.NextJoin{
+                        .join_op = .{ .in_or_out = .{} },
+                        .table_or_sub_query = &TableOrSubQueryClause{
+                            .table = TableOrSubQueryClause.Table{
+                                .qualified_table_name_with_alias = .{
+                                    .qualified_table_name = .{ .table_or_alias_name = "Company" },
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        } },
+    };
+
+    inline for (0..expected_stmt_list.len) |i| {
+        const expected_str = expected_stmt_list[i][0];
+        const stmt = expected_stmt_list[i][1];
+        qb.reset();
+        try qb.buildFromClause(stmt);
+        try testing.expectEqualSlices(u8, expected_str, qb.getSql());
+    }
+}
+
+test "query_builder_order_by" {
+    var gsqb = GeneralSQLQueryBuilder.init(testing.allocator);
+    defer gsqb.deinit();
+    var qb = gsqb.queryBuilder();
+
+    const expected_stmt_list = .{
+        .{ "ORDER BY \"name\"", OrderByClause{
+            .expr = StmtExpr{
+                .literal_value = ValueType{ .TEXT = "name" },
+            },
+        } },
+        .{ "ORDER BY \"name\" ASC NULLS FIRST", OrderByClause{
+            .expr = StmtExpr{
+                .literal_value = ValueType{ .TEXT = "name" },
+            },
+            .order = .asc,
+            .nulls_handling = .first,
+        } },
+    };
+
+    inline for (0..expected_stmt_list.len) |i| {
+        const expected_str = expected_stmt_list[i][0];
+        const stmt = expected_stmt_list[i][1];
+        qb.reset();
+        try qb.buildOrderByClause(stmt);
+        try testing.expectEqualSlices(u8, expected_str, qb.getSql());
+    }
+}
+
+test "query_builder_limit" {
+    var gsqb = GeneralSQLQueryBuilder.init(testing.allocator);
+    defer gsqb.deinit();
+    var qb = gsqb.queryBuilder();
+
+    const expected_stmt_list = .{
+        .{ "LIMIT 10", LimitClause{
+            .expr = .{ .literal_value = ValueType{ .INT64 = 10 } },
+        } },
+        .{ "LIMIT 10 OFFSET 20", LimitClause{
+            .expr = .{ .literal_value = ValueType{ .INT64 = 10 } },
+            .offset = .{ .literal_value = ValueType{ .INT64 = 20 } },
+        } },
+    };
+
+    inline for (0..expected_stmt_list.len) |i| {
+        const expected_str = expected_stmt_list[i][0];
+        const stmt = expected_stmt_list[i][1];
+        qb.reset();
+        try qb.buildLimitClause(stmt);
+        try testing.expectEqualSlices(u8, expected_str, qb.getSql());
+    }
+}
+
+test "query_builder_select_stmt" {
+    var gsqb = GeneralSQLQueryBuilder.init(testing.allocator);
+    defer gsqb.deinit();
+    var qb = gsqb.queryBuilder();
+
+    const expected_stmt_list = .{
+        .{
+            \\SELECT * FROM "User" AS 'U', "Skill" AS 'S' ON "U"."skill_id" = "S"."id" WHERE "U"."id" > 2 GROUP BY "name"
+            ,
+            SelectStmt{
+                .compound_select = &[_]CompoundSelect{
+                    CompoundSelect{
+                        .select_core = SelectCoreClause{
+                            .result_cols = &[_]SelectCoreClause.ResultCol{SelectCoreClause.ResultCol{
+                                .star = {},
+                            }},
+                            .from = FromClause{
+                                .join_clause = JoinClause{
+                                    .table_or_sub_query = &TableOrSubQueryClause{
+                                        .table = TableOrSubQueryClause.Table{
+                                            .qualified_table_name_with_alias = QualifiedTableNameWithAlias{
+                                                .qualified_table_name = QualifiedTableName{
+                                                    .table_or_alias_name = "User",
+                                                },
+                                                .alias = "U",
+                                            },
+                                        },
+                                    },
+                                    .next_joins = &[_]JoinClause.NextJoin{
+                                        JoinClause.NextJoin{
+                                            .table_or_sub_query = &TableOrSubQueryClause{
+                                                .table = TableOrSubQueryClause.Table{
+                                                    .qualified_table_name_with_alias = QualifiedTableNameWithAlias{
+                                                        .qualified_table_name = QualifiedTableName{
+                                                            .table_or_alias_name = "Skill",
+                                                        },
+                                                        .alias = "S",
+                                                    },
+                                                },
+                                            },
+                                            .join_constraint = .{
+                                                .on = &StmtExpr{
+                                                    .binary_expr = .{
+                                                        .op = .eq,
+                                                        .sub_expr_left = &StmtExpr{
+                                                            .qualified_col = QualifiedColName{
+                                                                .table_name = .{ .table_or_alias_name = "U" },
+                                                                .col_name = "skill_id",
+                                                            },
+                                                        },
+                                                        .sub_expr_right = &StmtExpr{
+                                                            .qualified_col = QualifiedColName{
+                                                                .table_name = .{ .table_or_alias_name = "S" },
+                                                                .col_name = "id",
+                                                            },
+                                                        },
+                                                    },
+                                                },
+                                            },
+                                        },
+                                    },
+                                },
+                            },
+                            .where = &StmtExpr{
+                                .binary_expr = .{
+                                    .op = .greater_than,
+                                    .sub_expr_left = &StmtExpr{
+                                        .qualified_col = QualifiedColName{
+                                            .table_name = .{ .table_or_alias_name = "U" },
+                                            .col_name = "id",
+                                        },
+                                    },
+                                    .sub_expr_right = &StmtExpr{ .literal_value = ValueType{ .INT64 = 2 } },
+                                },
+                            },
+                            .group_by = &[_]StmtExpr{
+                                StmtExpr{
+                                    .literal_value = ValueType{ .TEXT = "name" },
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    };
+
+    inline for (0..expected_stmt_list.len) |i| {
+        const expected_str = expected_stmt_list[i][0];
+        const stmt = expected_stmt_list[i][1];
+        qb.reset();
+        try qb.buildSelectStmt(stmt);
         try testing.expectEqualSlices(u8, expected_str, qb.getSql());
     }
 }

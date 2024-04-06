@@ -118,14 +118,15 @@ pub const ViewOpts = struct {
     col_names: []const []const u8 = undefined,
 };
 
+pub const ConflictHandling = enum {
+    rollback,
+    abort,
+    fail,
+    ignore,
+    replace,
+};
+
 pub const Constraint = union(enum) {
-    pub const ConflictHandling = enum {
-        rollback,
-        abort,
-        fail,
-        ignore,
-        replace,
-    };
     pub const Rule = enum {
         set_null,
         set_default,
@@ -1220,17 +1221,17 @@ pub const QualifiedColName = struct {
     col_name: []const u8,
 };
 
-pub const UnaryStmtExpr = struct {
+pub const UnaryExpr = struct {
     op: enum {
         minus,
         plus,
         bitwise_complement,
         not,
     },
-    sub_expr: *const StmtExpr,
+    sub_expr: *const Expr,
 };
 
-pub const BinaryStmtExpr = struct {
+pub const BinaryExpr = struct {
     op: enum {
         multiply,
         divide,
@@ -1256,31 +1257,31 @@ pub const BinaryStmtExpr = struct {
         and_,
         or_,
     },
-    sub_expr_left: *const StmtExpr,
-    sub_expr_right: *const StmtExpr,
+    sub_expr_left: *const Expr,
+    sub_expr_right: *const Expr,
 };
 
-pub const SuffixStmtExpr = struct {
+pub const SuffixExpr = struct {
     op: enum { isnull, notnull },
-    sub_expr: *const StmtExpr,
+    sub_expr: *const Expr,
 };
 
-pub const CastStmtExpr = struct {
-    sub_expr: *const StmtExpr,
+pub const CastExpr = struct {
+    sub_expr: *const Expr,
     as_type: ValueType,
 };
 
-pub const BetweenStmtExpr = struct {
+pub const BetweenExpr = struct {
     op: enum { between, not_between },
-    target_expr: *const StmtExpr,
-    range_start_expr: *const StmtExpr,
-    range_end_expr: *const StmtExpr,
+    target_expr: *const Expr,
+    range_start_expr: *const Expr,
+    range_end_expr: *const Expr,
 };
 
-pub const InStmtExpr = struct {
+pub const InExpr = struct {
     pub const Set = union(enum) {
-        sub_select: *const SelectStmt,
-        exprs: []const StmtExpr,
+        sub_select: *const SelectClause,
+        exprs: []const Expr,
         qualified_table: QualifiedTableName,
         function_call: FunctionCallClause,
     };
@@ -1289,27 +1290,27 @@ pub const InStmtExpr = struct {
     set: Set,
 };
 
-pub const ExistStmtExpr = struct {
+pub const ExistExpr = struct {
     op: enum { exist, not_exist },
-    select_stmt: *const SelectStmt,
+    select_clause: *const SelectClause,
 };
 
-pub const StmtExpr = union(enum) {
+pub const Expr = union(enum) {
     literal_value: ValueType,
     qualified_col: QualifiedColName,
-    unary_expr: UnaryStmtExpr,
-    binary_expr: BinaryStmtExpr,
-    suffix_expr: SuffixStmtExpr,
-    exist_expr: ExistStmtExpr,
-    cast_expr: CastStmtExpr,
-    between_expr: BetweenStmtExpr,
-    in_expr: InStmtExpr,
+    unary_expr: UnaryExpr,
+    binary_expr: BinaryExpr,
+    suffix_expr: SuffixExpr,
+    exist_expr: ExistExpr,
+    cast_expr: CastExpr,
+    between_expr: BetweenExpr,
+    in_expr: InExpr,
 };
 
 pub const FunctionCallClause = struct {
     schema_name: ?[]const u8 = null,
     function_name: []const u8,
-    exprs: []const StmtExpr,
+    exprs: []const Expr,
 };
 
 pub const TableOrSubQueryClause = union(enum) {
@@ -1325,7 +1326,7 @@ pub const TableOrSubQueryClause = union(enum) {
         as: ?[]const u8 = null,
     };
     pub const SelectAs = struct {
-        sub_select: *const SelectStmt,
+        sub_select: *const SelectClause,
         as: ?[]const u8 = null,
     };
 
@@ -1351,7 +1352,7 @@ pub const JoinClause = struct {
         cross: void,
     };
     pub const JoinConstraint = union(enum) {
-        on: *const StmtExpr,
+        on: *const Expr,
         using: []const QualifiedColName,
     };
     pub const NextJoin = struct {
@@ -1371,12 +1372,12 @@ pub const FromClause = union(enum) {
 
 pub const SelectCoreClause = struct {
     pub const ResultCol = union(enum) {
-        pub const Expr = struct {
-            expr: *const StmtExpr,
+        pub const ExprAs = struct {
+            expr: *const Expr,
             as: ?[]const u8 = null,
         };
 
-        expr: Expr,
+        expr: ExprAs,
         star: void,
         table_star: []const u8,
     };
@@ -1384,24 +1385,24 @@ pub const SelectCoreClause = struct {
     distinct: bool = false,
     result_cols: []const ResultCol,
     from: ?FromClause = null,
-    where: ?*const StmtExpr = null,
-    group_by: ?[]const StmtExpr = null,
-    having: ?*const StmtExpr = null,
+    where: ?*const Expr = null,
+    group_by: ?[]const Expr = null,
+    having: ?*const Expr = null,
 };
 
 pub const LimitClause = struct {
-    expr: StmtExpr,
-    offset: ?StmtExpr = null,
+    expr: Expr,
+    offset: ?Expr = null,
 };
 
 pub const OrderByClause = struct {
-    expr: StmtExpr,
+    expr: Expr,
     collate: ?[]const u8 = null,
     order: ?Order = null,
     nulls_handling: ?enum { first, last } = null,
 };
 
-pub const CompoundSelect = struct {
+pub const CompoundSelectClause = struct {
     select_core: SelectCoreClause,
     compound: ?enum {
         union_,
@@ -1411,33 +1412,33 @@ pub const CompoundSelect = struct {
     } = null,
 };
 
-pub const SelectStmt = struct {
-    compound_select: []const CompoundSelect,
+pub const SelectClause = struct {
+    compound_select: []const CompoundSelectClause,
     order_by: ?OrderByClause = null,
     limit: ?LimitClause = null,
 };
 
 pub const SetExprClause = struct {
     col_names: []const QualifiedColName,
-    expr: StmtExpr,
+    expr: Expr,
 };
 
 pub const UpsertClause = struct {
     pub const IndexedColumn = struct {
         col_or_expr: union(enum) {
             col: []const u8,
-            expr: StmtExpr,
+            expr: Expr,
         },
         collate: ?[]const u8 = null,
         order: ?Order = null,
     };
     pub const ConflictTargetClause = struct {
         indexed_columns: []const IndexedColumn,
-        where: ?StmtExpr = null,
+        where: ?Expr = null,
     };
     pub const UpdateSet = struct {
         set_exprs: []const SetExprClause,
-        where: ?StmtExpr = null,
+        where: ?Expr = null,
     };
     pub const UpdateStrategy = union(enum) {
         nothing: void,
@@ -1450,7 +1451,7 @@ pub const UpsertClause = struct {
 
 pub const ReturningClause = union(enum) {
     pub const ExprAs = struct {
-        expr: StmtExpr,
+        expr: Expr,
         as: ?[]const u8 = null,
     };
     pub const Item = union(enum) {
@@ -1460,15 +1461,15 @@ pub const ReturningClause = union(enum) {
     items: []const Item,
 };
 
-pub const InsertStmt = struct {
+pub const InsertClause = struct {
     pub const Payload = union(enum) {
-        values: []const StmtExpr,
-        sub_select: SelectStmt,
+        values: []const Expr,
+        sub_select: SelectClause,
         default_values: void,
     };
 
     verb: enum { replace, insert },
-    conflict_handling: ?Constraint.ConflictHandling = null,
+    conflict_handling: ?ConflictHandling = null,
     qualified_table_name_with_alias: QualifiedTableNameWithAlias,
     col_names: []const QualifiedColName,
     payload: Payload,
@@ -1476,19 +1477,33 @@ pub const InsertStmt = struct {
     returning_clause: ?ReturningClause = null,
 };
 
-pub const UpdateStmt = struct {
-    conflict_handling: ?Constraint.ConflictHandling = null,
+pub const UpdateClause = struct {
+    conflict_handling: ?ConflictHandling = null,
     qualified_table_name_with_alias: QualifiedTableNameWithAlias,
     set_values: []const SetExprClause,
     from: ?FromClause = null,
-    where: ?StmtExpr = null,
+    where: ?Expr = null,
     returning_clause: ?ReturningClause = null,
 };
 
-pub const Stmt = union(enum) {
-    select: SelectStmt,
-    insert: InsertStmt,
-    update: UpdateStmt,
+pub const DeleteClause = struct {
+    qualified_table_name_with_alias: QualifiedTableNameWithAlias,
+    where: ?Expr = null,
+    returning_clause: ?ReturningClause = null,
+};
+
+pub const RootClauseType = enum {
+    select,
+    insert,
+    update,
+    delete,
+};
+
+pub const RootClause = union(RootClauseType) {
+    select: SelectClause,
+    insert: InsertClause,
+    update: UpdateClause,
+    delete: DeleteClause,
 };
 
 pub const QueryBuilder = struct {
@@ -1497,11 +1512,12 @@ pub const QueryBuilder = struct {
         implReset: *const fn (ctx: *anyopaque) void,
         implGetSql: *const fn (ctx: *anyopaque) []const u8,
         implGetLocalType: *const fn (ctx: *anyopaque, value_type: ValueType) []const u8,
-        implBuildSelectStmt: *const fn (ctx: *anyopaque, select_stmt: SelectStmt) Error!void,
-        implBuildInsertStmt: *const fn (ctx: *anyopaque, insert_stmt: InsertStmt) Error!void,
-        implBuildUpdateStmt: *const fn (ctx: *anyopaque, update_stmt: UpdateStmt) Error!void,
-        implBuildStmtExpr: *const fn (ctx: *anyopaque, expr: StmtExpr, xhs: Xhs) Error!void,
-        implBuildCompoundSelect: *const fn (ctx: *anyopaque, compound_select: CompoundSelect) Error!void,
+        implBuildSelectClause: *const fn (ctx: *anyopaque, select_clause: SelectClause) Error!void,
+        implBuildInsertClause: *const fn (ctx: *anyopaque, insert_clause: InsertClause) Error!void,
+        implBuildUpdateClause: *const fn (ctx: *anyopaque, update_clause: UpdateClause) Error!void,
+        implBuildDeleteClause: *const fn (ctx: *anyopaque, delete_clause: DeleteClause) Error!void,
+        implBuildExpr: *const fn (ctx: *anyopaque, expr: Expr, xhs: Xhs) Error!void,
+        implBuildCompoundSelectClause: *const fn (ctx: *anyopaque, compound_select: CompoundSelectClause) Error!void,
         implBuildSelectCore: *const fn (ctx: *anyopaque, select_core: SelectCoreClause) Error!void,
         implBuildFunctionCall: *const fn (ctx: *anyopaque, func_call: FunctionCallClause) Error!void,
         implBuildUpsertClause: *const fn (ctx: *anyopaque, upsert_clause: UpsertClause) Error!void,
@@ -1529,32 +1545,37 @@ pub const QueryBuilder = struct {
         return this.vtable.implGetLocalType(this.ctx, value_type);
     }
 
-    pub inline fn buildStmt(this: *QueryBuilder, stmt: Stmt) Error!void {
-        switch (stmt) {
-            .select => |select_stmt| try this.vtable.implBuildSelectStmt(this.ctx, select_stmt),
-            .insert => |insert_stmt| try this.vtable.implBuildInsertStmt(this.ctx, insert_stmt),
-            .update => |update_stmt| try this.vtable.implBuildUpdateStmt(this.ctx, update_stmt),
+    pub inline fn buildRootClause(this: *QueryBuilder, root_clause: RootClause) Error!void {
+        switch (root_clause) {
+            .select => |select_clause| try this.vtable.implBuildSelectStmt(this.ctx, select_clause),
+            .insert => |insert_clause| try this.vtable.implBuildInsertStmt(this.ctx, insert_clause),
+            .update => |update_clause| try this.vtable.implBuildUpdateStmt(this.ctx, update_clause),
+            .delete => |delete_clause| try this.vtable.implBuildDeleteStmt(this.ctx, delete_clause),
         }
     }
 
-    pub inline fn buildSelectStmt(this: *QueryBuilder, select_stmt: SelectStmt) Error!void {
-        try this.vtable.implBuildSelectStmt(this.ctx, select_stmt);
+    pub inline fn buildSelectClause(this: *QueryBuilder, select_clause: SelectClause) Error!void {
+        try this.vtable.implBuildSelectClause(this.ctx, select_clause);
     }
 
-    pub inline fn buildInsertStmt(this: *QueryBuilder, insert_stmt: InsertStmt) Error!void {
-        try this.vtable.implBuildInsertStmt(this.ctx, insert_stmt);
+    pub inline fn buildInsertClause(this: *QueryBuilder, insert_clause: InsertClause) Error!void {
+        try this.vtable.implBuildInsertClause(this.ctx, insert_clause);
     }
 
-    pub inline fn buildUpdateStmt(this: *QueryBuilder, update_stmt: UpdateStmt) Error!void {
-        try this.vtable.implBuildUpdateStmt(this.ctx, update_stmt);
+    pub inline fn buildUpdateClause(this: *QueryBuilder, update_clause: UpdateClause) Error!void {
+        try this.vtable.implBuildUpdateClause(this.ctx, update_clause);
     }
 
-    pub inline fn buildStmtExpr(this: *QueryBuilder, expr: StmtExpr, xhs: Xhs) Error!void {
-        try this.vtable.implBuildStmtExpr(this.ctx, expr, xhs);
+    pub inline fn buildDeleteClause(this: *QueryBuilder, delete_clause: DeleteClause) Error!void {
+        try this.vtable.implBuildDeleteClause(this.ctx, delete_clause);
     }
 
-    pub inline fn buildCompoundSelect(this: *QueryBuilder, compound_select: SelectStmt.CompoundSelect) Error!void {
-        try this.vtable.implBuildCompoundSelect(this.ctx, compound_select);
+    pub inline fn buildExpr(this: *QueryBuilder, expr: Expr, xhs: Xhs) Error!void {
+        try this.vtable.implBuildExpr(this.ctx, expr, xhs);
+    }
+
+    pub inline fn buildCompoundSelectClause(this: *QueryBuilder, compound_select: CompoundSelectClause) Error!void {
+        try this.vtable.implBuildCompoundSelectClause(this.ctx, compound_select);
     }
 
     pub inline fn buildSelectCore(this: *QueryBuilder, select_core: SelectCoreClause) Error!void {
@@ -1607,11 +1628,12 @@ pub const GeneralSQLQueryBuilder = struct {
                 .implReset = reset,
                 .implGetSql = getSql,
                 .implGetLocalType = getLocalType,
-                .implBuildSelectStmt = buildSelectStmt,
-                .implBuildInsertStmt = buildInsertStmt,
-                .implBuildUpdateStmt = buildUpdateStmt,
-                .implBuildStmtExpr = buildStmtExpr,
-                .implBuildCompoundSelect = buildCompoundSelect,
+                .implBuildSelectClause = buildSelectClause,
+                .implBuildInsertClause = buildInsertClause,
+                .implBuildUpdateClause = buildUpdateClause,
+                .implBuildDeleteClause = buildDeleteClause,
+                .implBuildExpr = buildExpr,
+                .implBuildCompoundSelectClause = buildCompoundSelectClause,
                 .implBuildSelectCore = buildSelectCore,
                 .implBuildFunctionCall = buildFunctionCall,
                 .implBuildUpsertClause = buildUpsertClause,
@@ -1669,10 +1691,10 @@ pub const GeneralSQLQueryBuilder = struct {
             }
         }
         try sql_writer.print(" = ", .{});
-        try buildStmtExpr(ctx, set_expr.expr, .rhs);
+        try buildExpr(ctx, set_expr.expr, .rhs);
     }
 
-    pub fn buildConflictHandling(sql_writer: std.ArrayList(u8).Writer, ch: Constraint.ConflictHandling) Error!void {
+    pub fn buildConflictHandling(sql_writer: std.ArrayList(u8).Writer, ch: ConflictHandling) Error!void {
         switch (ch) {
             .abort => try sql_writer.print("OR ABORT ", .{}),
             .fail => try sql_writer.print("OR FAIL ", .{}),
@@ -1710,48 +1732,48 @@ pub const GeneralSQLQueryBuilder = struct {
         return @tagName(value_type);
     }
 
-    fn buildSelectStmt(ctx: *anyopaque, select_stmt: SelectStmt) Error!void {
+    fn buildSelectClause(ctx: *anyopaque, select_clause: SelectClause) Error!void {
         const b: *GeneralSQLQueryBuilder = @ptrCast(@alignCast(ctx));
         const sql_writer = b.sql_buf.writer();
-        for (select_stmt.compound_select, 0..) |cs, i| {
+        for (select_clause.compound_select, 0..) |cs, i| {
             if (i != 0) {
                 try sql_writer.print(" ", .{});
             }
-            try buildCompoundSelect(ctx, cs);
+            try buildCompoundSelectClause(ctx, cs);
         }
-        if (select_stmt.order_by) |order_by| {
+        if (select_clause.order_by) |order_by| {
             try sql_writer.print(" ", .{});
             try buildOrderByClause(ctx, order_by);
         }
-        if (select_stmt.limit) |limit| {
+        if (select_clause.limit) |limit| {
             try sql_writer.print(" ", .{});
             try buildLimitClause(ctx, limit);
         }
     }
 
-    fn buildInsertStmt(ctx: *anyopaque, insert_stmt: InsertStmt) Error!void {
+    fn buildInsertClause(ctx: *anyopaque, insert_clause: InsertClause) Error!void {
         const b: *GeneralSQLQueryBuilder = @ptrCast(@alignCast(ctx));
         const sql_writer = b.sql_buf.writer();
 
-        switch (insert_stmt.verb) {
+        switch (insert_clause.verb) {
             .replace => try sql_writer.print("REPLACE INTO ", .{}),
             .insert => {
                 try sql_writer.print("INSERT ", .{});
-                if (insert_stmt.conflict_handling) |ch| {
+                if (insert_clause.conflict_handling) |ch| {
                     try buildConflictHandling(sql_writer, ch);
                 }
                 try sql_writer.print("INTO ", .{});
             },
         }
 
-        try buildQualifiedTableName(sql_writer, insert_stmt.qualified_table_name_with_alias.qualified_table_name);
-        if (insert_stmt.qualified_table_name_with_alias.alias) |a| {
+        try buildQualifiedTableName(sql_writer, insert_clause.qualified_table_name_with_alias.qualified_table_name);
+        if (insert_clause.qualified_table_name_with_alias.alias) |a| {
             try sql_writer.print(" AS {s} ", .{a});
         }
 
-        if (insert_stmt.col_names.len > 0) {
+        if (insert_clause.col_names.len > 0) {
             try sql_writer.print("(", .{});
-            for (insert_stmt.col_names, 0..) |col_name, i| {
+            for (insert_clause.col_names, 0..) |col_name, i| {
                 if (i != 0) {
                     try sql_writer.print(", ", .{});
                 }
@@ -1760,26 +1782,26 @@ pub const GeneralSQLQueryBuilder = struct {
             try sql_writer.print(")", .{});
         }
 
-        switch (insert_stmt.payload) {
+        switch (insert_clause.payload) {
             .values => |v_arr| {
                 try sql_writer.print(" VALUES ( ", .{});
                 for (v_arr, 0..) |v, i| {
                     if (i != 0) {
                         try sql_writer.print(", ", .{});
                     }
-                    try buildStmtExpr(ctx, v, .rhs);
+                    try buildExpr(ctx, v, .rhs);
                 }
                 try sql_writer.print(" )", .{});
             },
-            .sub_select => |select_stmt| {
-                try buildSelectStmt(ctx, select_stmt);
+            .sub_select => |select_clause| {
+                try buildSelectClause(ctx, select_clause);
             },
             .default_values => try sql_writer.print("DEFAULT VALUES", .{}),
         }
 
-        if (insert_stmt.upsert_clauses.len > 0 and insert_stmt.payload != .default_values) {
+        if (insert_clause.upsert_clauses.len > 0 and insert_clause.payload != .default_values) {
             try sql_writer.print(" ", .{});
-            for (insert_stmt.upsert_clauses, 0..) |upsert_clause, i| {
+            for (insert_clause.upsert_clauses, 0..) |upsert_clause, i| {
                 if (i != 0) {
                     try sql_writer.print(", ", .{});
                 }
@@ -1787,45 +1809,63 @@ pub const GeneralSQLQueryBuilder = struct {
             }
         }
 
-        if (insert_stmt.returning_clause) |returning_clause| {
+        if (insert_clause.returning_clause) |returning_clause| {
             try sql_writer.print(" ", .{});
             try buildReturningClause(ctx, returning_clause);
         }
     }
 
-    fn buildUpdateStmt(ctx: *anyopaque, update_stmt: UpdateStmt) Error!void {
+    fn buildUpdateClause(ctx: *anyopaque, update_clause: UpdateClause) Error!void {
         const b: *GeneralSQLQueryBuilder = @ptrCast(@alignCast(ctx));
         const sql_writer = b.sql_buf.writer();
         try sql_writer.print("UPDATE ", .{});
-        if (update_stmt.conflict_handling) |ch| {
+        if (update_clause.conflict_handling) |ch| {
             try buildConflictHandling(sql_writer, ch);
         }
-        try buildQualifiedTableName(sql_writer, update_stmt.qualified_table_name_with_alias.qualified_table_name);
-        if (update_stmt.qualified_table_name_with_alias.alias) |a| {
+        try buildQualifiedTableName(sql_writer, update_clause.qualified_table_name_with_alias.qualified_table_name);
+        if (update_clause.qualified_table_name_with_alias.alias) |a| {
             try sql_writer.print(" AS '{s}'", .{a});
         }
         try sql_writer.print(" SET ", .{});
-        for (update_stmt.set_values, 0..) |sv, i| {
+        for (update_clause.set_values, 0..) |sv, i| {
             if (i != 0) {
                 try sql_writer.print(", ", .{});
             }
             try buildSetExprClause(ctx, sv);
         }
-        if (update_stmt.from) |from| {
+        if (update_clause.from) |from| {
             try sql_writer.print(" ", .{});
             _ = from;
         }
-        if (update_stmt.where) |where| {
+        if (update_clause.where) |where| {
             try sql_writer.print(" WHERE ", .{});
-            try buildStmtExpr(ctx, where, .rhs);
+            try buildExpr(ctx, where, .rhs);
         }
-        if (update_stmt.returning_clause) |rc| {
+        if (update_clause.returning_clause) |rc| {
             try sql_writer.print(" ", .{});
             try buildReturningClause(ctx, rc);
         }
     }
 
-    fn buildStmtExpr(ctx: *anyopaque, expr: StmtExpr, xhs: Xhs) Error!void {
+    fn buildDeleteClause(ctx: *anyopaque, delete_clause: DeleteClause) Error!void {
+        const b: *GeneralSQLQueryBuilder = @ptrCast(@alignCast(ctx));
+        const sql_writer = b.sql_buf.writer();
+        try sql_writer.print("DELETE FROM ", .{});
+        try buildQualifiedTableName(sql_writer, delete_clause.qualified_table_name_with_alias.qualified_table_name);
+        if (delete_clause.qualified_table_name_with_alias.alias) |a| {
+            try sql_writer.print(" AS '{s}'", .{a});
+        }
+        if (delete_clause.where) |where| {
+            try sql_writer.print(" WHERE ", .{});
+            try buildExpr(ctx, where, .rhs);
+        }
+        if (delete_clause.returning_clause) |returning_clause| {
+            try sql_writer.print(" ", .{});
+            try buildReturningClause(ctx, returning_clause);
+        }
+    }
+
+    fn buildExpr(ctx: *anyopaque, expr: Expr, xhs: Xhs) Error!void {
         const b: *GeneralSQLQueryBuilder = @ptrCast(@alignCast(ctx));
         const sql_writer = b.sql_buf.writer();
         switch (expr) {
@@ -1840,11 +1880,11 @@ pub const GeneralSQLQueryBuilder = struct {
                     .bitwise_complement => try sql_writer.print("~ ", .{}),
                     .not => try sql_writer.print("NOT ", .{}),
                 }
-                try buildStmtExpr(ctx, ue.sub_expr.*, .rhs);
+                try buildExpr(ctx, ue.sub_expr.*, .rhs);
             },
 
             .binary_expr => |be| {
-                try buildStmtExpr(ctx, be.sub_expr_left.*, .lhs);
+                try buildExpr(ctx, be.sub_expr_left.*, .lhs);
                 switch (be.op) {
                     .multiply => try sql_writer.print(" * ", .{}),
                     .divide => try sql_writer.print(" / ", .{}),
@@ -1870,11 +1910,11 @@ pub const GeneralSQLQueryBuilder = struct {
                     .and_ => try sql_writer.print(" AND ", .{}),
                     .or_ => try sql_writer.print(" OR ", .{}),
                 }
-                try buildStmtExpr(ctx, be.sub_expr_right.*, .rhs);
+                try buildExpr(ctx, be.sub_expr_right.*, .rhs);
             },
 
             .suffix_expr => |se| {
-                try buildStmtExpr(ctx, se.sub_expr.*, .lhs);
+                try buildExpr(ctx, se.sub_expr.*, .lhs);
                 switch (se.op) {
                     .isnull => try sql_writer.print(" IS NULL", .{}),
                     .notnull => try sql_writer.print(" IS NOT NULL", .{}),
@@ -1886,24 +1926,24 @@ pub const GeneralSQLQueryBuilder = struct {
                     .exist => try sql_writer.print("EXIST (", .{}),
                     .not_exist => try sql_writer.print("NOT EXIST (", .{}),
                 }
-                try buildSelectStmt(ctx, ee.select_stmt.*);
+                try buildSelectClause(ctx, ee.select_clause.*);
                 try sql_writer.print(")", .{});
             },
 
             .cast_expr => |ce| {
-                try buildStmtExpr(ctx, ce.sub_expr.*, .lhs);
+                try buildExpr(ctx, ce.sub_expr.*, .lhs);
                 try sql_writer.print(" AS {s}", .{getLocalType(ctx, ce.as_type)});
             },
 
             .between_expr => |be| {
-                try buildStmtExpr(ctx, be.target_expr.*, .lhs);
+                try buildExpr(ctx, be.target_expr.*, .lhs);
                 switch (be.op) {
                     .between => try sql_writer.print(" BETWEEN ", .{}),
                     .not_between => try sql_writer.print(" NOT BETWEEN ", .{}),
                 }
-                try buildStmtExpr(ctx, be.range_start_expr.*, .rhs);
+                try buildExpr(ctx, be.range_start_expr.*, .rhs);
                 try sql_writer.print(" AND ", .{});
-                try buildStmtExpr(ctx, be.range_end_expr.*, .rhs);
+                try buildExpr(ctx, be.range_end_expr.*, .rhs);
             },
 
             .in_expr => |ie| {
@@ -1914,7 +1954,7 @@ pub const GeneralSQLQueryBuilder = struct {
                 switch (ie.set) {
                     .sub_select => |s| {
                         try sql_writer.print("( ", .{});
-                        try buildSelectStmt(ctx, s.*);
+                        try buildSelectClause(ctx, s.*);
                         try sql_writer.print(" )", .{});
                     },
                     .qualified_table => |qt| try buildQualifiedTableName(sql_writer, qt),
@@ -1924,7 +1964,7 @@ pub const GeneralSQLQueryBuilder = struct {
                             if (i != 0) {
                                 try sql_writer.print(", ", .{});
                             }
-                            try buildStmtExpr(ctx, e, .rhs);
+                            try buildExpr(ctx, e, .rhs);
                         }
                         try sql_writer.print(" )", .{});
                     },
@@ -1936,7 +1976,7 @@ pub const GeneralSQLQueryBuilder = struct {
         }
     }
 
-    fn buildCompoundSelect(ctx: *anyopaque, compound_select: CompoundSelect) Error!void {
+    fn buildCompoundSelectClause(ctx: *anyopaque, compound_select: CompoundSelectClause) Error!void {
         const b: *GeneralSQLQueryBuilder = @ptrCast(@alignCast(ctx));
         const sql_writer = b.sql_buf.writer();
         try buildSelectCore(ctx, compound_select.select_core);
@@ -1960,7 +2000,7 @@ pub const GeneralSQLQueryBuilder = struct {
         for (select_core.result_cols) |result_col| {
             switch (result_col) {
                 .expr => |e| {
-                    try buildStmtExpr(ctx, e.expr.*, .lhs);
+                    try buildExpr(ctx, e.expr.*, .lhs);
                     if (e.as) |a| {
                         try sql_writer.print(" AS '{s}'", .{a});
                     }
@@ -1975,7 +2015,7 @@ pub const GeneralSQLQueryBuilder = struct {
         }
         if (select_core.where) |where| {
             try sql_writer.print(" WHERE ", .{});
-            try buildStmtExpr(ctx, where.*, .rhs);
+            try buildExpr(ctx, where.*, .rhs);
         }
         if (select_core.group_by) |group_by| {
             try sql_writer.print(" GROUP BY ", .{});
@@ -1983,12 +2023,12 @@ pub const GeneralSQLQueryBuilder = struct {
                 if (i != 0) {
                     try sql_writer.print(", ", .{});
                 }
-                try buildStmtExpr(ctx, by, .lhs);
+                try buildExpr(ctx, by, .lhs);
             }
         }
         if (select_core.having) |having| {
             try sql_writer.print(" HAVING ", .{});
-            try buildStmtExpr(ctx, having.*, .rhs);
+            try buildExpr(ctx, having.*, .rhs);
         }
     }
 
@@ -2003,7 +2043,7 @@ pub const GeneralSQLQueryBuilder = struct {
             if (i != 0) {
                 try sql_writer.print(", ", .{});
             }
-            try buildStmtExpr(ctx, expr, .rhs);
+            try buildExpr(ctx, expr, .rhs);
         }
         try sql_writer.print(")", .{});
     }
@@ -2021,7 +2061,7 @@ pub const GeneralSQLQueryBuilder = struct {
                     }
                     switch (indexed_column.col_or_expr) {
                         .col => |c| try sql_writer.print("\"{s}\"", .{c}),
-                        .expr => |e| try buildStmtExpr(ctx, e, .rhs),
+                        .expr => |e| try buildExpr(ctx, e, .rhs),
                     }
                     if (indexed_column.collate) |collate| {
                         try sql_writer.print(" ", .{});
@@ -2051,7 +2091,7 @@ pub const GeneralSQLQueryBuilder = struct {
                 }
                 if (u.where) |w| {
                     try sql_writer.print(" WHERE ", .{});
-                    try buildStmtExpr(ctx, w, .rhs);
+                    try buildExpr(ctx, w, .rhs);
                 }
             },
         }
@@ -2068,7 +2108,7 @@ pub const GeneralSQLQueryBuilder = struct {
             switch (item) {
                 .star => try sql_writer.print("*", .{}),
                 .expr_as => |ea| {
-                    try buildStmtExpr(ctx, ea.expr, .rhs);
+                    try buildExpr(ctx, ea.expr, .rhs);
                     if (ea.as) |as| {
                         try sql_writer.print(" AS '{s}'", .{as});
                     }
@@ -2101,7 +2141,7 @@ pub const GeneralSQLQueryBuilder = struct {
             },
             .sub_select => |ss| {
                 try sql_writer.print("( ", .{});
-                try buildSelectStmt(ctx, ss.sub_select.*);
+                try buildSelectClause(ctx, ss.sub_select.*);
                 try sql_writer.print(" )", .{});
                 if (ss.as) |a| {
                     try sql_writer.print(" AS '{s}'", .{a});
@@ -2167,7 +2207,7 @@ pub const GeneralSQLQueryBuilder = struct {
                 switch (join_constraint) {
                     .on => |on_expr| {
                         try sql_writer.print("ON ", .{});
-                        try buildStmtExpr(ctx, on_expr.*, .rhs);
+                        try buildExpr(ctx, on_expr.*, .rhs);
                     },
                     .using => |using_cols| {
                         try sql_writer.print("USING (", .{});
@@ -2205,7 +2245,7 @@ pub const GeneralSQLQueryBuilder = struct {
         const b: *GeneralSQLQueryBuilder = @ptrCast(@alignCast(ctx));
         const sql_writer = b.sql_buf.writer();
         try sql_writer.print("ORDER BY ", .{});
-        try buildStmtExpr(ctx, order_by.expr, .lhs);
+        try buildExpr(ctx, order_by.expr, .lhs);
         if (order_by.collate) |collate| {
             try sql_writer.print(" ", .{});
             try buildCollate(sql_writer, collate);
@@ -2227,10 +2267,10 @@ pub const GeneralSQLQueryBuilder = struct {
         const b: *GeneralSQLQueryBuilder = @ptrCast(@alignCast(ctx));
         const sql_writer = b.sql_buf.writer();
         try sql_writer.print("LIMIT ", .{});
-        try buildStmtExpr(ctx, limit.expr, .rhs);
+        try buildExpr(ctx, limit.expr, .rhs);
         if (limit.offset) |offset_expr| {
             try sql_writer.print(" OFFSET ", .{});
-            try buildStmtExpr(ctx, offset_expr, .rhs);
+            try buildExpr(ctx, offset_expr, .rhs);
         }
     }
 };
@@ -2648,6 +2688,104 @@ pub inline fn hasIndex(this: *Db, index_name: []const u8) Error!bool {
     return this.vtable.implHasIndex(this.ctx, this, index_name);
 }
 
+// CRUD interface
+
+pub const CRUD = struct {
+    arena: std.heap.ArenaAllocator,
+    execution_arena: std.heap.ArenaAllocator,
+    gsqb: ?GeneralSQLQueryBuilder = null,
+    qb: QueryBuilder,
+    db: *Db,
+    root_clause: ?*RootClause = null,
+
+    pub fn init(allocator: std.mem.Allocator, db: *Db, opts: struct {
+        custom_query_builder: ?QueryBuilder = null,
+    }) CRUD {
+        const arena = std.heap.ArenaAllocator.init(allocator);
+        var gsqb: ?GeneralSQLQueryBuilder = null;
+        const qb = brk: {
+            if (opts.custom_query_builder) |cqb| {
+                break :brk cqb;
+            } else {
+                gsqb = GeneralSQLQueryBuilder.init(arena.allocator());
+                break :brk gsqb.?.queryBuilder();
+            }
+        };
+        return CRUD{
+            .arena = arena,
+            .execution_arena = std.heap.ArenaAllocator.init(allocator),
+            .gsqb = gsqb,
+            .db = db,
+            .qb = qb,
+        };
+    }
+
+    pub fn deinit(this: *CRUD) void {
+        this.arena.deinit();
+    }
+
+    fn ensureRootClause(this: *CRUD) *RootClause {
+        if (this.stmt == null) {
+            @panic("Stmt not constructed!");
+        }
+        return this.stmt.?;
+    }
+
+    fn freeStmt(this: *CRUD) void {
+        if (this.stmt) |stmt| {
+            this.arena.allocator().destroy(stmt);
+        }
+        this.stmt = null;
+    }
+
+    fn checkCanQueryInto(root_clause: *RootClause) void {
+        switch (root_clause.*) {
+            .select_clause => {},
+            .insert_clause => |is| {
+                if (is.returning_clause == null) {
+                    @panic("insert stmt without returning caluse can not query into");
+                }
+            },
+            .update_clause => |us| {
+                if (us.returning_clause == null) {
+                    @panic("update stmt without returning caluse can not query into");
+                }
+            },
+            .delete_clause => |ds| {
+                if (ds.returning_clause == null) {
+                    @panic("delete stmt without returning caluse can not query into");
+                }
+            },
+        }
+    }
+
+    pub fn execute(this: *CRUD) Error!usize {
+        const stmt = this.ensureStmt();
+        try this.qb.buildStmt(stmt.*);
+        const sql = this.qb.getSql();
+        defer this.execution_arena.reset(.{ .free_all = {} });
+        return try this.db.queryExecuteSlice(this.execution_arena.allocator(), sql);
+    }
+
+    pub fn queryInto(this: *CRUD, allocator: std.mem.Allocator, comptime DestType: type) ![]DestType {
+        const root_clause = this.ensureRootClause();
+        checkCanQueryInto(root_clause);
+        try this.qb.buildRootClause(root_clause.*);
+        const sql = this.qb.getSql();
+        var query = try Query.init(allocator, this.db, sql, null);
+        defer query.deinit();
+        return try query.intoAlloc(DestType, .{});
+    }
+
+    pub fn insert(this: *CRUD, comptime table_schema: TableSchema, data: anytype) *CRUD {
+        this.freeStmt();
+        this.root_clause = this.arena.allocator().create(InsertClause);
+        _ = table_schema;
+        _ = data;
+        return this;
+    }
+};
+
 // all tests
 
 test "genSchema" {
@@ -2925,151 +3063,151 @@ test "query_builder_expr" {
 
     const expected_expr_list = .{
         // literal_value
-        .{ "5", StmtExpr{ .literal_value = ValueType{ .INT8 = 5 } } },
-        .{ "5", StmtExpr{ .literal_value = ValueType{ .INT16 = 5 } } },
-        .{ "5", StmtExpr{ .literal_value = ValueType{ .INT32 = 5 } } },
-        .{ "5", StmtExpr{ .literal_value = ValueType{ .INT64 = 5 } } },
-        .{ "5", StmtExpr{ .literal_value = ValueType{ .UINT8 = 5 } } },
-        .{ "5", StmtExpr{ .literal_value = ValueType{ .UINT16 = 5 } } },
-        .{ "5", StmtExpr{ .literal_value = ValueType{ .UINT32 = 5 } } },
-        .{ "5", StmtExpr{ .literal_value = ValueType{ .UINT64 = 5 } } },
-        .{ "5.1", StmtExpr{ .literal_value = ValueType{ .FLOAT32 = .{ .v = 5.1, .precision = 1 } } } },
-        .{ "5.10", StmtExpr{ .literal_value = ValueType{ .FLOAT32 = .{ .v = 5.1, .precision = 2 } } } },
-        .{ "5", StmtExpr{ .literal_value = ValueType{ .FLOAT32 = .{ .v = 5.0, .precision = 0 } } } },
-        .{ "5.1", StmtExpr{ .literal_value = ValueType{ .FLOAT64 = .{ .v = 5.1, .precision = 1 } } } },
-        .{ "'hello,5'", StmtExpr{ .literal_value = ValueType{ .TEXT = "hello,5" } } },
+        .{ "5", Expr{ .literal_value = ValueType{ .INT8 = 5 } } },
+        .{ "5", Expr{ .literal_value = ValueType{ .INT16 = 5 } } },
+        .{ "5", Expr{ .literal_value = ValueType{ .INT32 = 5 } } },
+        .{ "5", Expr{ .literal_value = ValueType{ .INT64 = 5 } } },
+        .{ "5", Expr{ .literal_value = ValueType{ .UINT8 = 5 } } },
+        .{ "5", Expr{ .literal_value = ValueType{ .UINT16 = 5 } } },
+        .{ "5", Expr{ .literal_value = ValueType{ .UINT32 = 5 } } },
+        .{ "5", Expr{ .literal_value = ValueType{ .UINT64 = 5 } } },
+        .{ "5.1", Expr{ .literal_value = ValueType{ .FLOAT32 = .{ .v = 5.1, .precision = 1 } } } },
+        .{ "5.10", Expr{ .literal_value = ValueType{ .FLOAT32 = .{ .v = 5.1, .precision = 2 } } } },
+        .{ "5", Expr{ .literal_value = ValueType{ .FLOAT32 = .{ .v = 5.0, .precision = 0 } } } },
+        .{ "5.1", Expr{ .literal_value = ValueType{ .FLOAT64 = .{ .v = 5.1, .precision = 1 } } } },
+        .{ "'hello,5'", Expr{ .literal_value = ValueType{ .TEXT = "hello,5" } } },
         // qualified_col
-        .{ "\"name\"", StmtExpr{ .qualified_col = .{ .col_name = "name" } } },
-        .{ "\"User\".\"name\"", StmtExpr{
+        .{ "\"name\"", Expr{ .qualified_col = .{ .col_name = "name" } } },
+        .{ "\"User\".\"name\"", Expr{
             .qualified_col = .{
                 .table_name = .{ .table_or_alias_name = "User" },
                 .col_name = "name",
             },
         } },
-        .{ "\"MyDb\".\"User\".\"name\"", StmtExpr{
+        .{ "\"MyDb\".\"User\".\"name\"", Expr{
             .qualified_col = .{
                 .table_name = .{ .schema_name = "MyDb", .table_or_alias_name = "User" },
                 .col_name = "name",
             },
         } },
         // unary_expr
-        .{ "- 5", StmtExpr{
+        .{ "- 5", Expr{
             .unary_expr = .{
                 .op = .minus,
-                .sub_expr = &StmtExpr{
+                .sub_expr = &Expr{
                     .literal_value = ValueType{ .INT64 = 5 },
                 },
             },
         } },
-        .{ "+ 5", StmtExpr{
+        .{ "+ 5", Expr{
             .unary_expr = .{
                 .op = .plus,
-                .sub_expr = &StmtExpr{ .literal_value = ValueType{ .INT64 = 5 } },
+                .sub_expr = &Expr{ .literal_value = ValueType{ .INT64 = 5 } },
             },
         } },
         // binary_expr
-        .{ "1 + 5", StmtExpr{
+        .{ "1 + 5", Expr{
             .binary_expr = .{
                 .op = .plus,
-                .sub_expr_left = &StmtExpr{ .literal_value = ValueType{ .INT64 = 1 } },
-                .sub_expr_right = &StmtExpr{ .literal_value = ValueType{ .INT64 = 5 } },
+                .sub_expr_left = &Expr{ .literal_value = ValueType{ .INT64 = 1 } },
+                .sub_expr_right = &Expr{ .literal_value = ValueType{ .INT64 = 5 } },
             },
         } },
-        .{ "1 - 5", StmtExpr{
+        .{ "1 - 5", Expr{
             .binary_expr = .{
                 .op = .minus,
-                .sub_expr_left = &StmtExpr{ .literal_value = ValueType{ .INT64 = 1 } },
-                .sub_expr_right = &StmtExpr{ .literal_value = ValueType{ .INT64 = 5 } },
+                .sub_expr_left = &Expr{ .literal_value = ValueType{ .INT64 = 1 } },
+                .sub_expr_right = &Expr{ .literal_value = ValueType{ .INT64 = 5 } },
             },
         } },
-        .{ "1 * 5", StmtExpr{
+        .{ "1 * 5", Expr{
             .binary_expr = .{
                 .op = .multiply,
-                .sub_expr_left = &StmtExpr{ .literal_value = ValueType{ .INT64 = 1 } },
-                .sub_expr_right = &StmtExpr{ .literal_value = ValueType{ .INT64 = 5 } },
+                .sub_expr_left = &Expr{ .literal_value = ValueType{ .INT64 = 1 } },
+                .sub_expr_right = &Expr{ .literal_value = ValueType{ .INT64 = 5 } },
             },
         } },
-        .{ "1 / 5", StmtExpr{
+        .{ "1 / 5", Expr{
             .binary_expr = .{
                 .op = .divide,
-                .sub_expr_left = &StmtExpr{ .literal_value = ValueType{ .INT64 = 1 } },
-                .sub_expr_right = &StmtExpr{ .literal_value = ValueType{ .INT64 = 5 } },
+                .sub_expr_left = &Expr{ .literal_value = ValueType{ .INT64 = 1 } },
+                .sub_expr_right = &Expr{ .literal_value = ValueType{ .INT64 = 5 } },
             },
         } },
-        .{ "1 % 5", StmtExpr{
+        .{ "1 % 5", Expr{
             .binary_expr = .{
                 .op = .mod,
-                .sub_expr_left = &StmtExpr{ .literal_value = ValueType{ .INT64 = 1 } },
-                .sub_expr_right = &StmtExpr{ .literal_value = ValueType{ .INT64 = 5 } },
+                .sub_expr_left = &Expr{ .literal_value = ValueType{ .INT64 = 1 } },
+                .sub_expr_right = &Expr{ .literal_value = ValueType{ .INT64 = 5 } },
             },
         } },
-        .{ "1 = 5", StmtExpr{
+        .{ "1 = 5", Expr{
             .binary_expr = .{
                 .op = .eq,
-                .sub_expr_left = &StmtExpr{ .literal_value = ValueType{ .INT64 = 1 } },
-                .sub_expr_right = &StmtExpr{ .literal_value = ValueType{ .INT64 = 5 } },
+                .sub_expr_left = &Expr{ .literal_value = ValueType{ .INT64 = 1 } },
+                .sub_expr_right = &Expr{ .literal_value = ValueType{ .INT64 = 5 } },
             },
         } },
-        .{ "1 != 5", StmtExpr{
+        .{ "1 != 5", Expr{
             .binary_expr = .{
                 .op = .not_eq,
-                .sub_expr_left = &StmtExpr{ .literal_value = ValueType{ .INT64 = 1 } },
-                .sub_expr_right = &StmtExpr{ .literal_value = ValueType{ .INT64 = 5 } },
+                .sub_expr_left = &Expr{ .literal_value = ValueType{ .INT64 = 1 } },
+                .sub_expr_right = &Expr{ .literal_value = ValueType{ .INT64 = 5 } },
             },
         } },
-        .{ "1 LIKE 5", StmtExpr{
+        .{ "1 LIKE 5", Expr{
             .binary_expr = .{
                 .op = .like,
-                .sub_expr_left = &StmtExpr{ .literal_value = ValueType{ .INT64 = 1 } },
-                .sub_expr_right = &StmtExpr{ .literal_value = ValueType{ .INT64 = 5 } },
+                .sub_expr_left = &Expr{ .literal_value = ValueType{ .INT64 = 1 } },
+                .sub_expr_right = &Expr{ .literal_value = ValueType{ .INT64 = 5 } },
             },
         } },
-        .{ "1 NOT LIKE 5", StmtExpr{
+        .{ "1 NOT LIKE 5", Expr{
             .binary_expr = .{
                 .op = .not_like,
-                .sub_expr_left = &StmtExpr{ .literal_value = ValueType{ .INT64 = 1 } },
-                .sub_expr_right = &StmtExpr{ .literal_value = ValueType{ .INT64 = 5 } },
+                .sub_expr_left = &Expr{ .literal_value = ValueType{ .INT64 = 1 } },
+                .sub_expr_right = &Expr{ .literal_value = ValueType{ .INT64 = 5 } },
             },
         } },
-        .{ "1 IS DISTINCT FROM 5", StmtExpr{
+        .{ "1 IS DISTINCT FROM 5", Expr{
             .binary_expr = .{
                 .op = .is_distinct_from,
-                .sub_expr_left = &StmtExpr{ .literal_value = ValueType{ .INT64 = 1 } },
-                .sub_expr_right = &StmtExpr{ .literal_value = ValueType{ .INT64 = 5 } },
+                .sub_expr_left = &Expr{ .literal_value = ValueType{ .INT64 = 1 } },
+                .sub_expr_right = &Expr{ .literal_value = ValueType{ .INT64 = 5 } },
             },
         } },
-        .{ "1 IS NOT DISTINCT FROM 5", StmtExpr{
+        .{ "1 IS NOT DISTINCT FROM 5", Expr{
             .binary_expr = .{
                 .op = .is_not_distinct_from,
-                .sub_expr_left = &StmtExpr{ .literal_value = ValueType{ .INT64 = 1 } },
-                .sub_expr_right = &StmtExpr{ .literal_value = ValueType{ .INT64 = 5 } },
+                .sub_expr_left = &Expr{ .literal_value = ValueType{ .INT64 = 1 } },
+                .sub_expr_right = &Expr{ .literal_value = ValueType{ .INT64 = 5 } },
             },
         } },
         // suffic_expr
-        .{ "1 IS NULL", StmtExpr{
+        .{ "1 IS NULL", Expr{
             .suffix_expr = .{
                 .op = .isnull,
-                .sub_expr = &StmtExpr{ .literal_value = ValueType{ .INT64 = 1 } },
+                .sub_expr = &Expr{ .literal_value = ValueType{ .INT64 = 1 } },
             },
         } },
-        .{ "1 IS NOT NULL", StmtExpr{
+        .{ "1 IS NOT NULL", Expr{
             .suffix_expr = .{
                 .op = .notnull,
-                .sub_expr = &StmtExpr{ .literal_value = ValueType{ .INT64 = 1 } },
+                .sub_expr = &Expr{ .literal_value = ValueType{ .INT64 = 1 } },
             },
         } },
         // exist_expr
-        .{ "EXIST (SELECT 1)", StmtExpr{
+        .{ "EXIST (SELECT 1)", Expr{
             .exist_expr = .{
                 .op = .exist,
-                .select_stmt = &SelectStmt{
-                    .compound_select = &[_]CompoundSelect{
-                        CompoundSelect{
+                .select_clause = &SelectClause{
+                    .compound_select = &[_]CompoundSelectClause{
+                        CompoundSelectClause{
                             .select_core = .{
                                 .result_cols = &[_]SelectCoreClause.ResultCol{
                                     SelectCoreClause.ResultCol{
-                                        .expr = SelectCoreClause.ResultCol.Expr{
-                                            .expr = &StmtExpr{ .literal_value = ValueType{ .INT64 = 1 } },
+                                        .expr = SelectCoreClause.ResultCol.ExprAs{
+                                            .expr = &Expr{ .literal_value = ValueType{ .INT64 = 1 } },
                                         },
                                     },
                                 },
@@ -3079,17 +3217,17 @@ test "query_builder_expr" {
                 },
             },
         } },
-        .{ "NOT EXIST (SELECT 1)", StmtExpr{
+        .{ "NOT EXIST (SELECT 1)", Expr{
             .exist_expr = .{
                 .op = .not_exist,
-                .select_stmt = &SelectStmt{
-                    .compound_select = &[_]CompoundSelect{
-                        CompoundSelect{
+                .select_clause = &SelectClause{
+                    .compound_select = &[_]CompoundSelectClause{
+                        CompoundSelectClause{
                             .select_core = .{
                                 .result_cols = &[_]SelectCoreClause.ResultCol{
                                     SelectCoreClause.ResultCol{
-                                        .expr = SelectCoreClause.ResultCol.Expr{
-                                            .expr = &StmtExpr{ .literal_value = ValueType{ .INT64 = 1 } },
+                                        .expr = SelectCoreClause.ResultCol.ExprAs{
+                                            .expr = &Expr{ .literal_value = ValueType{ .INT64 = 1 } },
                                         },
                                     },
                                 },
@@ -3100,42 +3238,42 @@ test "query_builder_expr" {
             },
         } },
         // cast_expr
-        .{ "5 AS TEXT", StmtExpr{
+        .{ "5 AS TEXT", Expr{
             .cast_expr = .{
-                .sub_expr = &StmtExpr{ .literal_value = ValueType{ .INT64 = 5 } },
+                .sub_expr = &Expr{ .literal_value = ValueType{ .INT64 = 5 } },
                 .as_type = ValueType.getUndefined([]const u8),
             },
         } },
         // between_expr
-        .{ "5 BETWEEN 1 AND 10", StmtExpr{
+        .{ "5 BETWEEN 1 AND 10", Expr{
             .between_expr = .{
                 .op = .between,
-                .target_expr = &StmtExpr{ .literal_value = ValueType{ .INT64 = 5 } },
-                .range_start_expr = &StmtExpr{ .literal_value = ValueType{ .INT64 = 1 } },
-                .range_end_expr = &StmtExpr{ .literal_value = ValueType{ .INT64 = 10 } },
+                .target_expr = &Expr{ .literal_value = ValueType{ .INT64 = 5 } },
+                .range_start_expr = &Expr{ .literal_value = ValueType{ .INT64 = 1 } },
+                .range_end_expr = &Expr{ .literal_value = ValueType{ .INT64 = 10 } },
             },
         } },
-        .{ "5 NOT BETWEEN 1 AND 10", StmtExpr{
+        .{ "5 NOT BETWEEN 1 AND 10", Expr{
             .between_expr = .{
                 .op = .not_between,
-                .target_expr = &StmtExpr{ .literal_value = ValueType{ .INT64 = 5 } },
-                .range_start_expr = &StmtExpr{ .literal_value = ValueType{ .INT64 = 1 } },
-                .range_end_expr = &StmtExpr{ .literal_value = ValueType{ .INT64 = 10 } },
+                .target_expr = &Expr{ .literal_value = ValueType{ .INT64 = 5 } },
+                .range_start_expr = &Expr{ .literal_value = ValueType{ .INT64 = 1 } },
+                .range_end_expr = &Expr{ .literal_value = ValueType{ .INT64 = 10 } },
             },
         } },
         // in_expr
-        .{ "IN ( SELECT 1 )", StmtExpr{
+        .{ "IN ( SELECT 1 )", Expr{
             .in_expr = .{
                 .op = .in,
                 .set = .{
-                    .sub_select = &SelectStmt{
-                        .compound_select = &[_]CompoundSelect{
-                            CompoundSelect{
+                    .sub_select = &SelectClause{
+                        .compound_select = &[_]CompoundSelectClause{
+                            CompoundSelectClause{
                                 .select_core = .{
                                     .result_cols = &[_]SelectCoreClause.ResultCol{
                                         SelectCoreClause.ResultCol{
-                                            .expr = SelectCoreClause.ResultCol.Expr{
-                                                .expr = &StmtExpr{ .literal_value = ValueType{ .INT64 = 1 } },
+                                            .expr = SelectCoreClause.ResultCol.ExprAs{
+                                                .expr = &Expr{ .literal_value = ValueType{ .INT64 = 1 } },
                                             },
                                         },
                                     },
@@ -3146,7 +3284,7 @@ test "query_builder_expr" {
                 },
             },
         } },
-        .{ "NOT IN \"User\"", StmtExpr{
+        .{ "NOT IN \"User\"", Expr{
             .in_expr = .{
                 .op = .not_in,
                 .set = .{
@@ -3154,26 +3292,26 @@ test "query_builder_expr" {
                 },
             },
         } },
-        .{ "NOT IN ( 1, 2, 3 )", StmtExpr{
+        .{ "NOT IN ( 1, 2, 3 )", Expr{
             .in_expr = .{
                 .op = .not_in,
                 .set = .{
-                    .exprs = &[_]StmtExpr{
-                        StmtExpr{ .literal_value = ValueType{ .INT64 = 1 } },
-                        StmtExpr{ .literal_value = ValueType{ .INT64 = 2 } },
-                        StmtExpr{ .literal_value = ValueType{ .INT64 = 3 } },
+                    .exprs = &[_]Expr{
+                        Expr{ .literal_value = ValueType{ .INT64 = 1 } },
+                        Expr{ .literal_value = ValueType{ .INT64 = 2 } },
+                        Expr{ .literal_value = ValueType{ .INT64 = 3 } },
                     },
                 },
             },
         } },
-        .{ "NOT IN sqrt(4)", StmtExpr{
+        .{ "NOT IN sqrt(4)", Expr{
             .in_expr = .{
                 .op = .not_in,
                 .set = .{
                     .function_call = .{
                         .function_name = "sqrt",
-                        .exprs = &[_]StmtExpr{
-                            StmtExpr{ .literal_value = ValueType{ .INT64 = 4 } },
+                        .exprs = &[_]Expr{
+                            Expr{ .literal_value = ValueType{ .INT64 = 4 } },
                         },
                     },
                 },
@@ -3185,7 +3323,7 @@ test "query_builder_expr" {
         const expected_str = expected_expr_list[i][0];
         const expr = expected_expr_list[i][1];
         qb.reset();
-        try qb.buildStmtExpr(expr, .rhs);
+        try qb.buildExpr(expr, .rhs);
         try testing.expectEqualSlices(u8, expected_str, qb.getSql());
     }
 }
@@ -3202,10 +3340,10 @@ test "query_builder_upsert_clause" {
                 .set_exprs = &[_]SetExprClause{
                     SetExprClause{
                         .col_names = &[_]QualifiedColName{QualifiedColName{ .col_name = "name" }},
-                        .expr = StmtExpr{ .literal_value = ValueType{ .TEXT = "John" } },
+                        .expr = Expr{ .literal_value = ValueType{ .TEXT = "John" } },
                     },
                 },
-                .where = StmtExpr{ .literal_value = ValueType{ .BOOL = true } },
+                .where = Expr{ .literal_value = ValueType{ .BOOL = true } },
             } },
         } },
         .{ "ON CONFLICT (\"name\") DO UPDATE SET \"name\" = 'John'", UpsertClause{
@@ -3220,7 +3358,7 @@ test "query_builder_upsert_clause" {
                 .set_exprs = &[_]SetExprClause{
                     SetExprClause{
                         .col_names = &[_]QualifiedColName{QualifiedColName{ .col_name = "name" }},
-                        .expr = StmtExpr{ .literal_value = ValueType{ .TEXT = "John" } },
+                        .expr = Expr{ .literal_value = ValueType{ .TEXT = "John" } },
                     },
                 },
             } },
@@ -3251,7 +3389,7 @@ test "query_builder_returning_clause" {
             .items = &[_]ReturningClause.Item{
                 ReturningClause.Item{
                     .expr_as = .{
-                        .expr = StmtExpr{
+                        .expr = Expr{
                             .literal_value = ValueType{ .TEXT = "John" },
                         },
                         .as = "name",
@@ -3263,7 +3401,7 @@ test "query_builder_returning_clause" {
             .items = &[_]ReturningClause.Item{
                 ReturningClause.Item{
                     .expr_as = .{
-                        .expr = StmtExpr{
+                        .expr = Expr{
                             .literal_value = ValueType{ .TEXT = "John" },
                         },
                         .as = "name",
@@ -3283,51 +3421,51 @@ test "query_builder_returning_clause" {
     }
 }
 
-test "query_builder_insert_stmt" {
+test "query_builder_insert_clause" {
     var gsqb = GeneralSQLQueryBuilder.init(testing.allocator);
     defer gsqb.deinit();
     var qb = gsqb.queryBuilder();
 
     const expected_stmt_list = .{
-        .{ "INSERT INTO \"User\" VALUES ( 1, 'John', TRUE )", InsertStmt{
+        .{ "INSERT INTO \"User\" VALUES ( 1, 'John', TRUE )", InsertClause{
             .verb = .insert,
             .qualified_table_name_with_alias = .{
                 .qualified_table_name = .{ .table_or_alias_name = "User" },
             },
             .col_names = &[0]QualifiedColName{},
             .payload = .{
-                .values = &[_]StmtExpr{
-                    StmtExpr{ .literal_value = ValueType{ .INT64 = 1 } },
-                    StmtExpr{ .literal_value = ValueType{ .TEXT = "John" } },
-                    StmtExpr{ .literal_value = ValueType{ .BOOL = true } },
+                .values = &[_]Expr{
+                    Expr{ .literal_value = ValueType{ .INT64 = 1 } },
+                    Expr{ .literal_value = ValueType{ .TEXT = "John" } },
+                    Expr{ .literal_value = ValueType{ .BOOL = true } },
                 },
             },
         } },
-        .{ "REPLACE INTO \"User\" VALUES ( 1, 'John', TRUE )", InsertStmt{
+        .{ "REPLACE INTO \"User\" VALUES ( 1, 'John', TRUE )", InsertClause{
             .verb = .replace,
             .qualified_table_name_with_alias = .{
                 .qualified_table_name = .{ .table_or_alias_name = "User" },
             },
             .col_names = &[0]QualifiedColName{},
             .payload = .{
-                .values = &[_]StmtExpr{
-                    StmtExpr{ .literal_value = ValueType{ .INT64 = 1 } },
-                    StmtExpr{ .literal_value = ValueType{ .TEXT = "John" } },
-                    StmtExpr{ .literal_value = ValueType{ .BOOL = true } },
+                .values = &[_]Expr{
+                    Expr{ .literal_value = ValueType{ .INT64 = 1 } },
+                    Expr{ .literal_value = ValueType{ .TEXT = "John" } },
+                    Expr{ .literal_value = ValueType{ .BOOL = true } },
                 },
             },
         } },
-        .{ "INSERT INTO \"User\" VALUES ( 1, 'John', TRUE ) ON CONFLICT DO UPDATE SET \"name\" = 'John'", InsertStmt{
+        .{ "INSERT INTO \"User\" VALUES ( 1, 'John', TRUE ) ON CONFLICT DO UPDATE SET \"name\" = 'John'", InsertClause{
             .verb = .insert,
             .qualified_table_name_with_alias = .{
                 .qualified_table_name = .{ .table_or_alias_name = "User" },
             },
             .col_names = &[0]QualifiedColName{},
             .payload = .{
-                .values = &[_]StmtExpr{
-                    StmtExpr{ .literal_value = ValueType{ .INT64 = 1 } },
-                    StmtExpr{ .literal_value = ValueType{ .TEXT = "John" } },
-                    StmtExpr{ .literal_value = ValueType{ .BOOL = true } },
+                .values = &[_]Expr{
+                    Expr{ .literal_value = ValueType{ .INT64 = 1 } },
+                    Expr{ .literal_value = ValueType{ .TEXT = "John" } },
+                    Expr{ .literal_value = ValueType{ .BOOL = true } },
                 },
             },
             .upsert_clauses = &[_]UpsertClause{UpsertClause{
@@ -3335,23 +3473,23 @@ test "query_builder_insert_stmt" {
                     .set_exprs = &[_]SetExprClause{
                         SetExprClause{
                             .col_names = &[_]QualifiedColName{QualifiedColName{ .col_name = "name" }},
-                            .expr = StmtExpr{ .literal_value = ValueType{ .TEXT = "John" } },
+                            .expr = Expr{ .literal_value = ValueType{ .TEXT = "John" } },
                         },
                     },
                 } },
             }},
         } },
-        .{ "INSERT INTO \"User\" VALUES ( 1, 'John', TRUE ) RETURNING *", InsertStmt{
+        .{ "INSERT INTO \"User\" VALUES ( 1, 'John', TRUE ) RETURNING *", InsertClause{
             .verb = .insert,
             .qualified_table_name_with_alias = .{
                 .qualified_table_name = .{ .table_or_alias_name = "User" },
             },
             .col_names = &[0]QualifiedColName{},
             .payload = .{
-                .values = &[_]StmtExpr{
-                    StmtExpr{ .literal_value = ValueType{ .INT64 = 1 } },
-                    StmtExpr{ .literal_value = ValueType{ .TEXT = "John" } },
-                    StmtExpr{ .literal_value = ValueType{ .BOOL = true } },
+                .values = &[_]Expr{
+                    Expr{ .literal_value = ValueType{ .INT64 = 1 } },
+                    Expr{ .literal_value = ValueType{ .TEXT = "John" } },
+                    Expr{ .literal_value = ValueType{ .BOOL = true } },
                 },
             },
             .returning_clause = ReturningClause{
@@ -3366,49 +3504,49 @@ test "query_builder_insert_stmt" {
         const expected_str = expected_stmt_list[i][0];
         const stmt = expected_stmt_list[i][1];
         qb.reset();
-        try qb.buildInsertStmt(stmt);
+        try qb.buildInsertClause(stmt);
         try testing.expectEqualSlices(u8, expected_str, qb.getSql());
     }
 }
 
-test "query_builder_update_stmt" {
+test "query_builder_update_clause" {
     var gsqb = GeneralSQLQueryBuilder.init(testing.allocator);
     defer gsqb.deinit();
     var qb = gsqb.queryBuilder();
 
     const expected_stmt_list = .{
-        .{ "UPDATE \"User\" SET \"name\" = 'John'", UpdateStmt{
+        .{ "UPDATE \"User\" SET \"name\" = 'John'", UpdateClause{
             .qualified_table_name_with_alias = .{ .qualified_table_name = .{ .table_or_alias_name = "User" } },
             .set_values = &[_]SetExprClause{
                 SetExprClause{
                     .col_names = &[_]QualifiedColName{QualifiedColName{ .col_name = "name" }},
-                    .expr = StmtExpr{ .literal_value = ValueType{ .TEXT = "John" } },
+                    .expr = Expr{ .literal_value = ValueType{ .TEXT = "John" } },
                 },
             },
         } },
-        .{ "UPDATE OR ROLLBACK \"User\" SET \"name\" = 'John'", UpdateStmt{
+        .{ "UPDATE OR ROLLBACK \"User\" SET \"name\" = 'John'", UpdateClause{
             .conflict_handling = .rollback,
             .qualified_table_name_with_alias = .{ .qualified_table_name = .{ .table_or_alias_name = "User" } },
             .set_values = &[_]SetExprClause{
                 SetExprClause{
                     .col_names = &[_]QualifiedColName{QualifiedColName{ .col_name = "name" }},
-                    .expr = StmtExpr{ .literal_value = ValueType{ .TEXT = "John" } },
+                    .expr = Expr{ .literal_value = ValueType{ .TEXT = "John" } },
                 },
             },
         } },
-        .{ "UPDATE OR ROLLBACK \"User\" SET \"name\" = 'John' WHERE \"id\" = 1", UpdateStmt{
+        .{ "UPDATE OR ROLLBACK \"User\" SET \"name\" = 'John' WHERE \"id\" = 1", UpdateClause{
             .conflict_handling = .rollback,
             .qualified_table_name_with_alias = .{ .qualified_table_name = .{ .table_or_alias_name = "User" } },
             .set_values = &[_]SetExprClause{
                 SetExprClause{
                     .col_names = &[_]QualifiedColName{QualifiedColName{ .col_name = "name" }},
-                    .expr = StmtExpr{ .literal_value = ValueType{ .TEXT = "John" } },
+                    .expr = Expr{ .literal_value = ValueType{ .TEXT = "John" } },
                 },
             },
-            .where = StmtExpr{ .binary_expr = .{
+            .where = Expr{ .binary_expr = .{
                 .op = .eq,
-                .sub_expr_left = &StmtExpr{ .literal_value = ValueType{ .TEXT = "id" } },
-                .sub_expr_right = &StmtExpr{ .literal_value = ValueType{ .INT64 = 1 } },
+                .sub_expr_left = &Expr{ .literal_value = ValueType{ .TEXT = "id" } },
+                .sub_expr_right = &Expr{ .literal_value = ValueType{ .INT64 = 1 } },
             } },
         } },
     };
@@ -3417,7 +3555,7 @@ test "query_builder_update_stmt" {
         const expected_str = expected_stmt_list[i][0];
         const stmt = expected_stmt_list[i][1];
         qb.reset();
-        try qb.buildUpdateStmt(stmt);
+        try qb.buildUpdateClause(stmt);
         try testing.expectEqualSlices(u8, expected_str, qb.getSql());
     }
 }
@@ -3440,21 +3578,21 @@ test "query_builder_table_or_subquery" {
             .table_function_call_as = TableOrSubQueryClause.TableFunctionCallAs{
                 .function_call = FunctionCallClause{
                     .function_name = "sqrt",
-                    .exprs = &[_]StmtExpr{StmtExpr{ .literal_value = ValueType{ .INT64 = 4 } }},
+                    .exprs = &[_]Expr{Expr{ .literal_value = ValueType{ .INT64 = 4 } }},
                 },
                 .as = "SqrtOf4",
             },
         } },
         .{ "( SELECT 1 ) AS 'tmp_user'", TableOrSubQueryClause{
             .sub_select = .{
-                .sub_select = &SelectStmt{
-                    .compound_select = &[_]CompoundSelect{
-                        CompoundSelect{
+                .sub_select = &SelectClause{
+                    .compound_select = &[_]CompoundSelectClause{
+                        CompoundSelectClause{
                             .select_core = .{
                                 .result_cols = &[_]SelectCoreClause.ResultCol{
                                     SelectCoreClause.ResultCol{
-                                        .expr = SelectCoreClause.ResultCol.Expr{
-                                            .expr = &StmtExpr{ .literal_value = ValueType{ .INT64 = 1 } },
+                                        .expr = SelectCoreClause.ResultCol.ExprAs{
+                                            .expr = &Expr{ .literal_value = ValueType{ .INT64 = 1 } },
                                         },
                                     },
                                 },
@@ -3477,14 +3615,14 @@ test "query_builder_table_or_subquery" {
                 },
                 TableOrSubQueryClause{
                     .sub_select = .{
-                        .sub_select = &SelectStmt{
-                            .compound_select = &[_]CompoundSelect{
-                                CompoundSelect{
+                        .sub_select = &SelectClause{
+                            .compound_select = &[_]CompoundSelectClause{
+                                CompoundSelectClause{
                                     .select_core = .{
                                         .result_cols = &[_]SelectCoreClause.ResultCol{
                                             SelectCoreClause.ResultCol{
-                                                .expr = SelectCoreClause.ResultCol.Expr{
-                                                    .expr = &StmtExpr{ .literal_value = ValueType{ .INT64 = 1 } },
+                                                .expr = SelectCoreClause.ResultCol.ExprAs{
+                                                    .expr = &Expr{ .literal_value = ValueType{ .INT64 = 1 } },
                                                 },
                                             },
                                         },
@@ -3647,17 +3785,17 @@ test "query_builder_select_core" {
                     },
                 },
             },
-            .where = &StmtExpr{ .literal_value = ValueType{ .BOOL = true } },
-            .group_by = &[_]StmtExpr{
-                StmtExpr{ .literal_value = ValueType{ .TEXT = "name" } },
+            .where = &Expr{ .literal_value = ValueType{ .BOOL = true } },
+            .group_by = &[_]Expr{
+                Expr{ .literal_value = ValueType{ .TEXT = "name" } },
             },
-            .having = &StmtExpr{
+            .having = &Expr{
                 .binary_expr = .{
                     .op = .eq,
-                    .sub_expr_left = &StmtExpr{
+                    .sub_expr_left = &Expr{
                         .literal_value = ValueType{ .TEXT = "id" },
                     },
-                    .sub_expr_right = &StmtExpr{
+                    .sub_expr_right = &Expr{
                         .literal_value = ValueType{ .INT64 = 1 },
                     },
                 },
@@ -3684,14 +3822,14 @@ test "query_builder_from_clause" {
             .table_or_sub_queries = &[_]TableOrSubQueryClause{
                 TableOrSubQueryClause{
                     .sub_select = TableOrSubQueryClause.SelectAs{
-                        .sub_select = &SelectStmt{
-                            .compound_select = &[_]CompoundSelect{
-                                CompoundSelect{
+                        .sub_select = &SelectClause{
+                            .compound_select = &[_]CompoundSelectClause{
+                                CompoundSelectClause{
                                     .select_core = .{
                                         .result_cols = &[_]SelectCoreClause.ResultCol{
                                             SelectCoreClause.ResultCol{
-                                                .expr = SelectCoreClause.ResultCol.Expr{
-                                                    .expr = &StmtExpr{ .literal_value = ValueType{ .INT64 = 1 } },
+                                                .expr = SelectCoreClause.ResultCol.ExprAs{
+                                                    .expr = &Expr{ .literal_value = ValueType{ .INT64 = 1 } },
                                                 },
                                             },
                                         },
@@ -3744,12 +3882,12 @@ test "query_builder_order_by" {
 
     const expected_stmt_list = .{
         .{ "ORDER BY \"name\"", OrderByClause{
-            .expr = StmtExpr{
+            .expr = Expr{
                 .literal_value = ValueType{ .TEXT = "name" },
             },
         } },
         .{ "ORDER BY \"name\" ASC NULLS FIRST", OrderByClause{
-            .expr = StmtExpr{
+            .expr = Expr{
                 .literal_value = ValueType{ .TEXT = "name" },
             },
             .order = .asc,
@@ -3790,7 +3928,42 @@ test "query_builder_limit" {
     }
 }
 
-test "query_builder_select_stmt" {
+test "query_builder_delete_clause" {
+    var gsqb = GeneralSQLQueryBuilder.init(testing.allocator);
+    defer gsqb.deinit();
+    var qb = gsqb.queryBuilder();
+
+    const expected_stmt_list = .{
+        .{ "DELETE FROM \"User\" WHERE \"id\" = 1", DeleteClause{
+            .qualified_table_name_with_alias = .{
+                .qualified_table_name = .{
+                    .table_or_alias_name = "User",
+                },
+            },
+            .where = Expr{
+                .binary_expr = .{
+                    .op = .eq,
+                    .sub_expr_left = &Expr{
+                        .literal_value = ValueType{ .TEXT = "id" },
+                    },
+                    .sub_expr_right = &Expr{
+                        .literal_value = ValueType{ .INT64 = 1 },
+                    },
+                },
+            },
+        } },
+    };
+
+    inline for (0..expected_stmt_list.len) |i| {
+        const expected_str = expected_stmt_list[i][0];
+        const stmt = expected_stmt_list[i][1];
+        qb.reset();
+        try qb.buildDeleteClause(stmt);
+        try testing.expectEqualSlices(u8, expected_str, qb.getSql());
+    }
+}
+
+test "query_builder_select_clause" {
     var gsqb = GeneralSQLQueryBuilder.init(testing.allocator);
     defer gsqb.deinit();
     var qb = gsqb.queryBuilder();
@@ -3799,9 +3972,9 @@ test "query_builder_select_stmt" {
         .{
             \\SELECT * FROM "User" AS 'U', "Skill" AS 'S' ON "U"."skill_id" = "S"."id" WHERE "U"."id" > 2 GROUP BY "name"
             ,
-            SelectStmt{
-                .compound_select = &[_]CompoundSelect{
-                    CompoundSelect{
+            SelectClause{
+                .compound_select = &[_]CompoundSelectClause{
+                    CompoundSelectClause{
                         .select_core = SelectCoreClause{
                             .result_cols = &[_]SelectCoreClause.ResultCol{SelectCoreClause.ResultCol{
                                 .star = {},
@@ -3831,16 +4004,16 @@ test "query_builder_select_stmt" {
                                                 },
                                             },
                                             .join_constraint = .{
-                                                .on = &StmtExpr{
+                                                .on = &Expr{
                                                     .binary_expr = .{
                                                         .op = .eq,
-                                                        .sub_expr_left = &StmtExpr{
+                                                        .sub_expr_left = &Expr{
                                                             .qualified_col = QualifiedColName{
                                                                 .table_name = .{ .table_or_alias_name = "U" },
                                                                 .col_name = "skill_id",
                                                             },
                                                         },
-                                                        .sub_expr_right = &StmtExpr{
+                                                        .sub_expr_right = &Expr{
                                                             .qualified_col = QualifiedColName{
                                                                 .table_name = .{ .table_or_alias_name = "S" },
                                                                 .col_name = "id",
@@ -3853,20 +4026,20 @@ test "query_builder_select_stmt" {
                                     },
                                 },
                             },
-                            .where = &StmtExpr{
+                            .where = &Expr{
                                 .binary_expr = .{
                                     .op = .greater_than,
-                                    .sub_expr_left = &StmtExpr{
+                                    .sub_expr_left = &Expr{
                                         .qualified_col = QualifiedColName{
                                             .table_name = .{ .table_or_alias_name = "U" },
                                             .col_name = "id",
                                         },
                                     },
-                                    .sub_expr_right = &StmtExpr{ .literal_value = ValueType{ .INT64 = 2 } },
+                                    .sub_expr_right = &Expr{ .literal_value = ValueType{ .INT64 = 2 } },
                                 },
                             },
-                            .group_by = &[_]StmtExpr{
-                                StmtExpr{
+                            .group_by = &[_]Expr{
+                                Expr{
                                     .literal_value = ValueType{ .TEXT = "name" },
                                 },
                             },
@@ -3881,7 +4054,14 @@ test "query_builder_select_stmt" {
         const expected_str = expected_stmt_list[i][0];
         const stmt = expected_stmt_list[i][1];
         qb.reset();
-        try qb.buildSelectStmt(stmt);
+        try qb.buildSelectClause(stmt);
         try testing.expectEqualSlices(u8, expected_str, qb.getSql());
     }
 }
+
+// test "tmp_exp" {
+//     const s = try testing.allocator.create(InsertStmt);
+//     // s.* = std.mem.zeroInit(InsertStmt, .{});
+//     // std.debug.print("{*}\n", .{s});
+//     defer testing.allocator.destroy(s);
+// }

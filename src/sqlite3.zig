@@ -21,6 +21,8 @@ const Constraint = generalDb.Constraint;
 const TableSchema = generalDb.TableSchema;
 const ColOpts = generalDb.ColOpts;
 const ViewOpts = generalDb.ViewOpts;
+const ConflictHandling = generalDb.ConflictHandling;
+const Order = generalDb.Order;
 
 const is_x64 = @sizeOf(usize) == 8;
 
@@ -147,7 +149,8 @@ pub const SqliteDb = struct {
             .BOOL => if (vt.BOOL) try writer.print("1", .{}) else try writer.print("0", .{}),
             .INT8, .INT16, .INT32, .INT64 => |iv| try writer.print("{d}", .{iv}),
             .UINT8, .UINT16, .UINT32, .UINT64 => |iv| try writer.print("{d}", .{iv}),
-            .FLOAT32, .FLOAT64 => |fv| try writer.print("{d}", .{fv}),
+            .FLOAT32 => |fv| try writer.print("{d}", .{fv.v}),
+            .FLOAT64 => |fv| try writer.print("{d}", .{fv.v}),
             .TEXT => |tv| try writer.print("'{s}'", .{tv}),
             .BLOB => unreachable,
         }
@@ -209,8 +212,7 @@ pub const SqliteDb = struct {
         }
 
         if (query.raw_bind_args) |bind_args| {
-            var next_index: usize = 1;
-            for (bind_args) |bind_arg| {
+            for (bind_args, 1..) |bind_arg, arg_idx| {
                 const idx = brk: {
                     if (bind_arg.namez) |namez| {
                         const name_idx = sqlite3.sqlite3_bind_parameter_index(s.stmt, namez.ptr);
@@ -220,9 +222,7 @@ pub const SqliteDb = struct {
                         }
                         break :brk name_idx;
                     } else {
-                        const next_idx = next_index;
-                        next_index += 1;
-                        break :brk next_idx;
+                        break :brk arg_idx;
                     }
                 };
 
@@ -237,7 +237,7 @@ pub const SqliteDb = struct {
                         try SqliteDb.checkBindResultOk(ret);
                     },
                     .FLOAT64 => |f64v| {
-                        ret = sqlite3.sqlite3_bind_double(s.stmt, idx, f64v);
+                        ret = sqlite3.sqlite3_bind_double(s.stmt, idx, f64v.v);
                         try SqliteDb.checkBindResultOk(ret);
                     },
                     .TEXT => |textv| {
@@ -324,7 +324,7 @@ pub const SqliteDb = struct {
                     .allocator = s.allocator,
                     .row = row,
                     .name = name,
-                    .value = ValueType{ .FLOAT64 = f64v },
+                    .value = ValueType{ .FLOAT64 = .{ .v = f64v } },
                 };
             },
             sqlite3.SQLITE3_TEXT => {
@@ -443,8 +443,8 @@ pub const SqliteDb = struct {
                 try sql_writer.print(",", .{});
             }
             try sql_writer.print("'{s}'", .{index.keys[i]});
-            if (index.opts.sortings) |sortings| {
-                switch (sortings[i]) {
+            if (index.opts.orders) |orders| {
+                switch (orders[i]) {
                     .asc => try sql_writer.print(" ASC", .{}),
                     .desc => try sql_writer.print(" DESC", .{}),
                 }
@@ -453,7 +453,7 @@ pub const SqliteDb = struct {
         try sql_writer.print(")", .{});
     }
 
-    fn genConflictHandling(sql_writer: std.ArrayList(u8).Writer, on_conflict: ?Constraint.ConflictHandling) Error!void {
+    fn genConflictHandling(sql_writer: std.ArrayList(u8).Writer, on_conflict: ?ConflictHandling) Error!void {
         if (on_conflict) |oc| {
             switch (oc) {
                 .rollback => try sql_writer.print(" ON CONFLICT ROLLBACK", .{}),
@@ -919,7 +919,7 @@ test "query" {
     const output_writer = output_buf.writer();
     {
         const expected_output =
-            \\row 0: 1=db.ValueType{ .INT64 = 1 },"hello"=db.ValueType{ .TEXT = { 104, 101, 108, 108, 111 } },5.0=db.ValueType{ .FLOAT64 = 5.0e+00 },
+            \\row 0: 1=1,"hello"="hello",5.0=5,
             \\
         ;
         output_buf.clearRetainingCapacity();
@@ -944,18 +944,18 @@ test "query" {
     }
     {
         const expected_output =
-            \\row 0: ?=db.ValueType{ .INT64 = 1 },$name=db.ValueType{ .FLOAT64 = 5.0e+00 },?2=db.ValueType{ .FLOAT64 = 5.0e+00 },
+            \\row 0: ?=1,$name="hello",?3=5,
             \\
         ;
         output_buf.clearRetainingCapacity();
         var q = try Query.init(
             testing.allocator,
             &db,
-            "select ?, $name, ?2",
+            "select ?, $name, ?3",
             &[_]QueryArg{
                 QueryArg{ .value = .{ .INT64 = 1 } },
                 QueryArg{ .namez = "$name", .value = .{ .TEXT = "hello" } },
-                QueryArg{ .value = .{ .FLOAT64 = 5.0 } },
+                QueryArg{ .value = .{ .FLOAT64 = .{ .v = 5.0 } } },
             },
         );
         defer q.deinit();
@@ -1079,7 +1079,7 @@ test "simple_migration" {
             fn up(ctx: *anyopaque) Error!?ChangeSet {
                 const m: *Self = @ptrCast(@alignCast(ctx));
                 var change_set = try ChangeSet.init(m.allocator);
-                const user_table = SchemaUtil.genSchemaOne(User);
+                const user_table = comptime SchemaUtil.genSchemaOne(User);
                 try m.db.createTable(&change_set, user_table, .{});
                 return change_set;
             }
@@ -1087,7 +1087,7 @@ test "simple_migration" {
             fn down(ctx: *anyopaque) Error!?ChangeSet {
                 const m: *Self = @ptrCast(@alignCast(ctx));
                 var change_set = try ChangeSet.init(m.allocator);
-                const user_table = SchemaUtil.genSchemaOne(User);
+                const user_table = comptime SchemaUtil.genSchemaOne(User);
                 try m.db.dropTable(&change_set, user_table.table_name, .{});
                 return change_set;
             }
@@ -1124,7 +1124,7 @@ test "simple_migration" {
             fn up(ctx: *anyopaque) Error!?ChangeSet {
                 const m: *Self = @ptrCast(@alignCast(ctx));
                 var change_set = try ChangeSet.init(m.allocator);
-                const user_table = SchemaUtil.genSchemaOne(User);
+                const user_table = comptime SchemaUtil.genSchemaOne(User);
                 try m.db.createTable(&change_set, user_table, .{});
                 try m.db.addColumn(
                     &change_set,
@@ -1170,7 +1170,7 @@ test "simple_migration" {
             fn up(ctx: *anyopaque) Error!?ChangeSet {
                 const m: *Self = @ptrCast(@alignCast(ctx));
                 var change_set = try ChangeSet.init(m.allocator);
-                const user_table = SchemaUtil.genSchemaOne(User);
+                const user_table = comptime SchemaUtil.genSchemaOne(User);
                 try m.db.createTable(&change_set, user_table, .{});
                 try m.db.dropColumn(&change_set, user_table.table_name, "name", .{});
                 return change_set;
@@ -1207,7 +1207,7 @@ test "simple_migration" {
             fn up(ctx: *anyopaque) Error!?ChangeSet {
                 const m: *Self = @ptrCast(@alignCast(ctx));
                 var change_set = try ChangeSet.init(m.allocator);
-                const user_table = SchemaUtil.genSchemaOne(User);
+                const user_table = comptime SchemaUtil.genSchemaOne(User);
                 try m.db.createTable(&change_set, user_table, .{});
                 try m.db.renameTable(&change_set, user_table.table_name, "user_renamed", .{});
                 return change_set;
@@ -1244,7 +1244,7 @@ test "simple_migration" {
             fn up(ctx: *anyopaque) Error!?ChangeSet {
                 const m: *Self = @ptrCast(@alignCast(ctx));
                 var change_set = try ChangeSet.init(m.allocator);
-                const user_table = SchemaUtil.genSchemaOne(User);
+                const user_table = comptime SchemaUtil.genSchemaOne(User);
                 try m.db.createTable(&change_set, user_table, .{});
                 try m.db.renameColumn(&change_set, user_table.table_name, "name", "nickname", .{});
                 return change_set;
@@ -1262,7 +1262,7 @@ test "complex_migration" {
         id: i64,
         name: []const u8,
         pub const indexes = .{
-            .{ [_][]const u8{"name"}, IndexOpts{ .unique = true, .sortings = &[1]IndexOpts.Sorting{.desc} } },
+            .{ [_][]const u8{"name"}, IndexOpts{ .unique = true, .orders = &[1]Order{.desc} } },
         };
     };
     const Skill = struct {
@@ -1312,7 +1312,7 @@ test "complex_migration" {
             fn up(ctx: *anyopaque) Error!?ChangeSet {
                 const m: *Self = @ptrCast(@alignCast(ctx));
                 var change_set = try ChangeSet.init(m.allocator);
-                const table_schemas = SchemaUtil.genSchema(.{ User, Company, Skill });
+                const table_schemas = comptime SchemaUtil.genSchema(.{ User, Company, Skill });
                 try m.db.createTables(&change_set, table_schemas, .{});
                 return change_set;
             }
@@ -1341,7 +1341,7 @@ test "complex_migration" {
             fn up(ctx: *anyopaque) Error!?ChangeSet {
                 const m: *Self = @ptrCast(@alignCast(ctx));
                 var change_set = try ChangeSet.init(m.allocator);
-                const user_table_schema = SchemaUtil.genSchemaOne(User);
+                const user_table_schema = comptime SchemaUtil.genSchemaOne(User);
                 const new_col_type = user_table_schema.columns[3].type;
                 var new_col_opts = user_table_schema.columns[3].opts;
                 new_col_opts.nullable = false;
@@ -1362,7 +1362,7 @@ test "validate_table_schemas" {
         id: i64,
         name: []const u8,
         pub const indexes = .{
-            .{ [_][]const u8{"name"}, IndexOpts{ .unique = true, .sortings = &[1]IndexOpts.Sorting{.desc} } },
+            .{ [_][]const u8{"name"}, IndexOpts{ .unique = true, .orders = &[1]Order{.desc} } },
         };
     };
     const Skill = struct {
@@ -1406,7 +1406,7 @@ test "validate_table_schemas" {
         var db: Db = sdb.getDb();
         try db.open();
         defer db.close();
-        const table_schemas = SchemaUtil.genSchema(.{ User, Company, Skill });
+        const table_schemas = comptime SchemaUtil.genSchema(.{ User, Company, Skill });
         var table_availability = try db.validateTableSchemas(testing.allocator, table_schemas);
         defer {
             table_availability.deinit();
@@ -1433,7 +1433,7 @@ test "index_funcs" {
         name: []const u8,
         location: ?[]const u8,
         pub const indexes = .{
-            .{ [_][]const u8{"name"}, IndexOpts{ .unique = true, .sortings = &[1]IndexOpts.Sorting{.desc} } },
+            .{ [_][]const u8{"name"}, IndexOpts{ .unique = true, .orders = &[1]Order{.desc} } },
         };
     };
     {
@@ -1462,7 +1462,7 @@ test "index_funcs" {
             fn up(ctx: *anyopaque) Error!?ChangeSet {
                 const m: *Self = @ptrCast(@alignCast(ctx));
                 var change_set = try ChangeSet.init(m.allocator);
-                const company_table = SchemaUtil.genSchemaOne(Company);
+                const company_table = comptime SchemaUtil.genSchemaOne(Company);
                 try m.db.createTable(&change_set, company_table, .{});
                 try m.db.createIndex(
                     &change_set,
@@ -1511,7 +1511,7 @@ test "view_funcs" {
         name: []const u8,
         location: ?[]const u8,
         pub const indexes = .{
-            .{ [_][]const u8{"name"}, IndexOpts{ .unique = true, .sortings = &[1]IndexOpts.Sorting{.desc} } },
+            .{ [_][]const u8{"name"}, IndexOpts{ .unique = true, .orders = &[1]Order{.desc} } },
         };
     };
     {

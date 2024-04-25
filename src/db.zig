@@ -191,12 +191,12 @@ pub const TableSchema = struct {
     };
 
     table_name: []const u8 = undefined,
-    columns: []Column = undefined,
+    columns: []const Column = undefined,
     primary_key: Constraint.PrimaryKey,
-    foreign_keys: []Constraint.ForeignKey,
-    indexes: []Index,
-    checks: []Constraint.Check,
-    dependencies: []Dependency = undefined,
+    foreign_keys: []const Constraint.ForeignKey,
+    indexes: []const Index,
+    checks: []const Constraint.Check,
+    dependencies: []const Dependency = undefined,
 };
 
 pub const SchemaUtil = struct {
@@ -413,7 +413,8 @@ pub const SchemaUtil = struct {
             for (0..decl_index[0].len) |j| {
                 final_name = final_name ++ "_" ++ decl_index[0][j];
             }
-            return final_name;
+            const final_name_const = final_name;
+            return final_name_const;
         }
     }
 
@@ -427,7 +428,8 @@ pub const SchemaUtil = struct {
             for (0..decl_index[0].len) |j| {
                 keys[j] = decl_index[0][j];
             }
-            return &keys;
+            const keys_const = keys;
+            return &keys_const;
         }
     }
 
@@ -550,6 +552,10 @@ pub const SchemaUtil = struct {
                 )
             else
                 @as(usize, 0);
+            var foreign_keys_final: [foreign_key_count]Constraint.ForeignKey = undefined;
+            for (0..foreign_key_count) |i| {
+                foreign_keys_final[i] = foreign_keys[i];
+            }
 
             const has_indexes = if (with_decl_indexes) @field(EntType, "indexes").len > 0 else false;
             const index_capacity = if (with_decl_indexes) @field(EntType, "indexes").len else 0;
@@ -572,13 +578,17 @@ pub const SchemaUtil = struct {
                 }
             }
 
+            const ent_cols_const = ent_cols;
+            const indexes_const = indexes;
+            const checks_const = checks;
+            const foreign_keys_const = foreign_keys_final;
             return TableSchema{
                 .table_name = table_name,
-                .columns = &ent_cols,
+                .columns = &ent_cols_const,
                 .primary_key = primary_key,
-                .foreign_keys = foreign_keys[0..foreign_key_count],
-                .indexes = &indexes,
-                .checks = &checks,
+                .foreign_keys = &foreign_keys_const,
+                .indexes = &indexes_const,
+                .checks = &checks_const,
             };
         }
     }
@@ -683,11 +693,14 @@ pub const SchemaUtil = struct {
             };
             ent_cols[0].opts.unique = true;
 
+            const ent_cols_const = ent_cols;
+            const foreign_keys_const = foreign_keys;
+
             return TableSchema{
                 .table_name = table_name,
-                .columns = &ent_cols,
+                .columns = &ent_cols_const,
                 .primary_key = primary_key,
-                .foreign_keys = &foreign_keys,
+                .foreign_keys = &foreign_keys_const,
                 .indexes = &[0]TableSchema.Index{},
                 .checks = &[0]Constraint.Check{},
             };
@@ -701,93 +714,94 @@ pub const SchemaUtil = struct {
         comptime m2m_table_start: usize,
         comptime all_tables_len: usize,
     ) usize {
-        var table_schema_added: usize = 0;
-        var next_table_schema_slot: usize = all_tables_len;
-        var total_tables_len: usize = all_tables_len;
-
-        const ti_struct = @typeInfo(EntType).Struct;
-        const decls = ti_struct.decls;
-
-        comptime var with_decl_relations: bool = false;
         comptime {
+            var table_schema_added: usize = 0;
+            var next_table_schema_slot: usize = all_tables_len;
+            var total_tables_len: usize = all_tables_len;
+
+            const ti_struct = @typeInfo(EntType).Struct;
+            const decls = ti_struct.decls;
+
+            var with_decl_relations: bool = false;
             for (0..decls.len) |i| {
                 if (std.mem.eql(u8, decls[i].name, "relations")) {
                     with_decl_relations = true;
                 }
             }
-        }
 
-        if (!with_decl_relations) {
-            return 0;
-        }
+            if (!with_decl_relations) {
+                return 0;
+            }
 
-        const decl_relations = @field(EntType, "relations");
+            const decl_relations = @field(EntType, "relations");
 
-        for (0..decl_relations.len) |i| {
-            const decl_relation = decl_relations[i];
-            switch (decl_relation[3].association) {
-                .one_to_one, .many_to_one => {},
-                .many_to_many => {
-                    const target_col_name = decl_relation[0];
-                    const target_foreign_col_name = decl_relation[2];
-                    const target_foreign_table_name = getLastTypeName(decl_relation[1]);
+            for (0..decl_relations.len) |i| {
+                const decl_relation = decl_relations[i];
+                switch (decl_relation[3].association) {
+                    .one_to_one, .many_to_one => {},
+                    .many_to_many => {
+                        const target_col_name = decl_relation[0];
+                        const target_foreign_col_name = decl_relation[2];
+                        const target_foreign_table_name = getLastTypeName(decl_relation[1]);
 
-                    const m2m_table_name = calcM2MTableName(
-                        target.table_name,
-                        target_col_name,
-                        target_foreign_table_name,
-                        target_foreign_col_name,
-                    );
-                    const found = brk: {
-                        for (all_tables[m2m_table_start..total_tables_len]) |table| {
-                            if (std.mem.eql(u8, m2m_table_name, table.table_name)) {
-                                break :brk true;
-                            }
-                        }
-                        break :brk false;
-                    };
-                    if (!found) {
-                        const target_foreign = brk: {
-                            const wanted = target_foreign_table_name;
-                            for (0..m2m_table_start) |j| {
-                                if (std.mem.eql(u8, wanted, all_tables[j].table_name)) {
-                                    break :brk &all_tables[j];
-                                }
-                            }
-                            unreachable;
-                        };
-                        all_tables[next_table_schema_slot] = genM2MTableSchema(
-                            m2m_table_name,
-                            target,
+                        const m2m_table_name = calcM2MTableName(
+                            target.table_name,
                             target_col_name,
-                            target_foreign,
+                            target_foreign_table_name,
                             target_foreign_col_name,
                         );
-                        next_table_schema_slot += 1;
-                        total_tables_len += 1;
-                        table_schema_added += 1;
-                    } else {
-                        continue;
-                    }
-                },
+                        const found = brk: {
+                            for (all_tables[m2m_table_start..total_tables_len]) |table| {
+                                if (std.mem.eql(u8, m2m_table_name, table.table_name)) {
+                                    break :brk true;
+                                }
+                            }
+                            break :brk false;
+                        };
+                        if (!found) {
+                            const target_foreign = brk: {
+                                const wanted = target_foreign_table_name;
+                                for (0..m2m_table_start) |j| {
+                                    if (std.mem.eql(u8, wanted, all_tables[j].table_name)) {
+                                        break :brk &all_tables[j];
+                                    }
+                                }
+                                unreachable;
+                            };
+                            all_tables[next_table_schema_slot] = genM2MTableSchema(
+                                m2m_table_name,
+                                target,
+                                target_col_name,
+                                target_foreign,
+                                target_foreign_col_name,
+                            );
+                            next_table_schema_slot += 1;
+                            total_tables_len += 1;
+                            table_schema_added += 1;
+                        } else {
+                            continue;
+                        }
+                    },
+                }
             }
-        }
 
-        return table_schema_added;
+            const table_schema_added_const = table_schema_added;
+            return table_schema_added_const;
+        }
     }
 
     /// genSchemaOne will not do relation checking, which needs to be manually checked later
     pub fn genSchemaOne(comptime EntType: type) TableSchema {
-        const final_table_schema = comptime brk: {
+        comptime {
             checkEntDef(EntType);
-            break :brk calcTableSchema(EntType);
-        };
-        return final_table_schema;
+            const table_schema = calcTableSchema(EntType);
+            return table_schema;
+        }
     }
 
     /// genSchema will auto do relation checking
-    pub fn genSchema(comptime ent_type_tuple: anytype) []TableSchema {
-        const final_table_schemas = comptime brk: {
+    pub fn genSchema(comptime ent_type_tuple: anytype) []const TableSchema {
+        comptime {
             if (!isTuple(@TypeOf(ent_type_tuple))) {
                 @compileError("build only accepts a tuple of ent type struct, found:" ++ @typeName(@TypeOf(ent_type_tuple)));
             }
@@ -824,12 +838,17 @@ pub const SchemaUtil = struct {
                 SchemaUtil.checkRelation(&table_schemas[i], &table_schemas);
             }
 
-            break :brk table_schemas[0..table_schema_gen_count];
-        };
-        return final_table_schemas;
+            var table_schemas_final: [table_schema_gen_count]TableSchema = undefined;
+            for (0..table_schema_gen_count) |i| {
+                table_schemas_final[i] = table_schemas[i];
+            }
+
+            const table_schemas_const = table_schemas_final;
+            return &table_schemas_const;
+        }
     }
 
-    pub inline fn dumpTableDependencies(table_schemas: []TableSchema) void {
+    pub inline fn dumpTableDependencies(table_schemas: []const TableSchema) void {
         for (table_schemas) |table_schema| {
             std.debug.print("table {s} dependencies:", .{table_schema.table_name});
             if (table_schema.foreign_keys.len > 0) {
@@ -845,6 +864,9 @@ pub const SchemaUtil = struct {
 // query
 
 pub const ValueType = union(DataType) {
+    pub const F32T = struct { v: f32, precision: ?usize = null };
+    pub const F64T = struct { v: f64, precision: ?usize = null };
+
     NULL: void, // not used but has to make zig compiler happy
     BOOL: bool,
     INT8: i8,
@@ -855,8 +877,8 @@ pub const ValueType = union(DataType) {
     UINT32: u32,
     INT64: i64,
     UINT64: u64,
-    FLOAT32: struct { v: f32, precision: ?usize = null },
-    FLOAT64: struct { v: f64, precision: ?usize = null },
+    FLOAT32: F32T,
+    FLOAT64: F64T,
     TEXT: []const u8,
     BLOB: []const i8,
 
@@ -899,6 +921,12 @@ pub const ValueType = union(DataType) {
     pub fn getValue(vt: *const ValueType, comptime WantedType: type, allocator: std.mem.Allocator) !WantedType {
         const ti = @typeInfo(ValueType);
         inline for (ti.Union.fields) |field| {
+            if (WantedType == f64) {
+                return vt.FLOAT64.v;
+            }
+            if (WantedType == f32) {
+                return vt.FLOAT32.v;
+            }
             if (field.type == WantedType) {
                 switch (field.type) {
                     []const u8 => return try allocator.dupe(u8, @field(vt, field.name)),
@@ -908,6 +936,82 @@ pub const ValueType = union(DataType) {
             }
         }
         @panic(@typeName(WantedType) ++ " can not be found in ValueType.");
+    }
+
+    pub fn format(
+        this: *const ValueType,
+        comptime fmt: []const u8,
+        options: std.fmt.FormatOptions,
+        writer: anytype,
+    ) @TypeOf(writer).Error!void {
+        _ = options;
+        _ = fmt;
+
+        const FPrintUtil = struct {
+            // morden long double requires at 21bytes to serialize, so we use 64 should be enough
+            //https://en.cppreference.com/w/c/types/limits#Limits_of_floating_point_types
+            var decimal_buf: [64]u8 = undefined;
+            pub fn fToString(fv: anytype, precision: usize) !struct {
+                integer: []const u8,
+                fraction: []const u8,
+            } {
+                const intv = @round(fv * @as(@TypeOf(fv), @floatFromInt(std.math.pow(usize, 10, precision))));
+                const vstr = try std.fmt.bufPrint(&decimal_buf, "{d}", .{intv});
+                return .{
+                    .integer = vstr[0 .. vstr.len - precision],
+                    .fraction = vstr[(vstr.len - precision)..],
+                };
+            }
+        };
+
+        switch (this.*) {
+            .BOOL => |bv| {
+                if (bv) {
+                    try writer.print("TRUE", .{});
+                } else {
+                    try writer.print("FALSE", .{});
+                }
+            },
+            .INT8 => |i8v| try writer.print("{d}", .{i8v}),
+            .UINT8 => |u8v| try writer.print("{d}", .{u8v}),
+            .INT16 => |i16v| try writer.print("{d}", .{i16v}),
+            .UINT16 => |u16v| try writer.print("{d}", .{u16v}),
+            .INT32 => |i32v| try writer.print("{d}", .{i32v}),
+            .UINT32 => |u32v| try writer.print("{d}", .{u32v}),
+            .INT64 => |i64v| try writer.print("{d}", .{i64v}),
+            .UINT64 => |u64v| try writer.print("{d}", .{u64v}),
+            .FLOAT32 => |f32v| {
+                if (f32v.precision) |p| {
+                    const vstr = try FPrintUtil.fToString(f32v.v, p);
+                    if (vstr.fraction.len > 0) {
+                        try writer.print("{s}.{s}", .{ vstr.integer, vstr.fraction });
+                    } else {
+                        try writer.print("{s}", .{vstr.integer});
+                    }
+                } else {
+                    try writer.print("{d}", .{f32v.v});
+                }
+            },
+            .FLOAT64 => |f64v| {
+                if (f64v.precision) |p| {
+                    const vstr = try FPrintUtil.fToString(f64v.v, p);
+                    if (vstr.fraction.len > 0) {
+                        try writer.print("{s}.{s}", .{ vstr.integer, vstr.fraction });
+                    } else {
+                        try writer.print("{s}", .{vstr.integer});
+                    }
+                } else {
+                    try writer.print("{d}", .{f64v.v});
+                }
+            },
+            .TEXT => |tv| {
+                try writer.print("\"{s}\"", .{tv});
+            },
+            .BLOB => {
+                @panic("TODO blob toString");
+            },
+            else => unreachable,
+        }
     }
 
     pub fn toSql(this: *const ValueType, sql_writer: std.ArrayList(u8).Writer, xhs: Xhs) !void {
@@ -2429,7 +2533,7 @@ pub inline fn useDatabase(this: *Db, name: []const u8) Error!void {
 
 pub inline fn queryEvaluate(this: *Db, query: *Query) Error!void {
     if (verbose) {
-        std.debug.print("evaluate query: {s}\n", .{query.raw_query});
+        std.debug.print("\nevaluate query: {s}\n", .{query.raw_query});
     }
     try this.vtable.implQueryEvaluate(this.ctx, query);
 }
@@ -2499,7 +2603,7 @@ pub const TableAvailablityMap = struct {
 };
 
 /// returned string hashmap of TableAvailablity must be freed by user
-pub fn validateTableSchemas(this: *Db, allocator: std.mem.Allocator, table_schemas: []TableSchema) !TableAvailablityMap {
+pub fn validateTableSchemas(this: *Db, allocator: std.mem.Allocator, table_schemas: []const TableSchema) !TableAvailablityMap {
     var arena = std.heap.ArenaAllocator.init(allocator);
     var known_tables = std.StringArrayHashMap(TableAvailablity).init(arena.allocator());
     var buf: [8192]u8 = undefined;
@@ -2584,7 +2688,7 @@ fn createTableToChangeSet(this: *Db, change_set: *ChangeSet, table_schema: Table
     try table_created.put(table_schema.table_name, {});
 }
 
-pub fn createTables(this: *Db, change_set: *ChangeSet, table_schemas: []TableSchema, opts: DbVTable.CreateTableOpts) Error!void {
+pub fn createTables(this: *Db, change_set: *ChangeSet, table_schemas: []const TableSchema, opts: DbVTable.CreateTableOpts) Error!void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
 
@@ -2725,34 +2829,34 @@ pub const CRUD = struct {
     }
 
     fn ensureRootClause(this: *CRUD) *RootClause {
-        if (this.stmt == null) {
-            @panic("Stmt not constructed!");
+        if (this.root_clause == null) {
+            @panic("Root clause not constructed!");
         }
-        return this.stmt.?;
+        return this.root_clause.?;
     }
 
-    fn freeStmt(this: *CRUD) void {
-        if (this.stmt) |stmt| {
-            this.arena.allocator().destroy(stmt);
+    fn freeClause(this: *CRUD) void {
+        if (this.root_clause) |root_clause| {
+            this.arena.allocator().destroy(root_clause);
         }
-        this.stmt = null;
+        this.root_clause = null;
     }
 
     fn checkCanQueryInto(root_clause: *RootClause) void {
         switch (root_clause.*) {
             .select_clause => {},
-            .insert_clause => |is| {
-                if (is.returning_clause == null) {
+            .insert_clause => |ic| {
+                if (ic.returning_clause == null) {
                     @panic("insert stmt without returning caluse can not query into");
                 }
             },
-            .update_clause => |us| {
-                if (us.returning_clause == null) {
+            .update_clause => |uc| {
+                if (uc.returning_clause == null) {
                     @panic("update stmt without returning caluse can not query into");
                 }
             },
-            .delete_clause => |ds| {
-                if (ds.returning_clause == null) {
+            .delete_clause => |dc| {
+                if (dc.returning_clause == null) {
                     @panic("delete stmt without returning caluse can not query into");
                 }
             },
@@ -2760,8 +2864,8 @@ pub const CRUD = struct {
     }
 
     pub fn execute(this: *CRUD) Error!usize {
-        const stmt = this.ensureStmt();
-        try this.qb.buildStmt(stmt.*);
+        const root_clause = this.ensureRootClause();
+        try this.qb.buildRootClause(root_clause.*);
         const sql = this.qb.getSql();
         defer this.execution_arena.reset(.{ .free_all = {} });
         return try this.db.queryExecuteSlice(this.execution_arena.allocator(), sql);
@@ -2821,7 +2925,7 @@ test "genSchema" {
         pub const checks = .{.{"name NOT IN ('User', 'Company')"}};
     };
     {
-        const user_table = SchemaUtil.genSchemaOne(User);
+        const user_table: TableSchema = comptime SchemaUtil.genSchemaOne(User);
 
         try testing.expectEqualSlices(u8, "User", user_table.table_name);
         try testing.expectEqualDeep(&[_]TableSchema.Column{
@@ -2877,7 +2981,7 @@ test "genSchema" {
         );
     }
     {
-        const tables = SchemaUtil.genSchema(.{ User, Company, Skill });
+        const tables = comptime SchemaUtil.genSchema(.{ User, Company, Skill });
         try testing.expectEqual(4, tables.len);
 
         const user_table = tables[0];
